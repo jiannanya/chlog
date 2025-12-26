@@ -19,16 +19,45 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <semaphore>
 #include <shared_mutex>
 #include <source_location>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#if defined(CHLOG_USE_FMT)
+    #include <fmt/format.h>
+#endif
+
 namespace chlog {
+
+namespace detail {
+
+template <class... Args>
+inline std::string format_payload(std::format_string<Args...> fmt, Args&&... args) {
+#if defined(CHLOG_USE_FMT)
+    // Use fmt for speed; std::format_string still provides compile-time checking.
+    return fmt::format(fmt::runtime(fmt.get()), std::forward<Args>(args)...);
+#else
+    return std::format(fmt, std::forward<Args>(args)...);
+#endif
+}
+
+template <class... Args>
+inline std::string vformat_payload(std::string_view fmt, Args&&... args) {
+#if defined(CHLOG_USE_FMT)
+    return fmt::vformat(fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(std::forward<Args>(args)...));
+#else
+    return std::vformat(fmt, std::make_format_args(std::forward<Args>(args)...));
+#endif
+}
+
+}  // namespace detail
 
 // =========================== Levels & Config ===========================
 
@@ -73,6 +102,14 @@ struct logger_config {
     // Pattern tokens: {ts} {date} {time} {ms} {lvl} {tid} {name} {msg} {file} {line} {func}
     // Special pattern: {json} outputs a structured JSON line.
     std::string pattern = "[{date} {time}.{ms}][{lvl}][tid={tid}][{name}] {msg}";
+
+    // Metadata capture controls.
+    // These are performance-critical in tight loops. If your pattern is "{msg}" and your sinks
+    // don't rely on metadata fields, disabling these avoids per-call work.
+    bool capture_timestamp = true;
+    bool capture_thread_id = true;
+    bool capture_logger_name = true;
+    bool capture_source_location = true;
 
     chlog::level flush_on_level = chlog::level::error;
 
@@ -505,8 +542,13 @@ inline constexpr std::size_t round_up_pow2(std::size_t x) noexcept {
 
 struct queue_wait {
     std::mutex m;
-    std::condition_variable cv_not_empty;
     std::condition_variable cv_not_full;
+    // Hint to reduce producer-side cacheline traffic: producers notify only if the
+    // consumer is likely waiting.
+    std::atomic<bool> sleeping{false};
+    // Semaphore used purely as a wakeup mechanism for the single consumer.
+    // counting_semaphore<1> behaves like a binary semaphore and avoids permit buildup.
+    std::counting_semaphore<1> sem_not_empty{0};
     std::atomic<bool> stop{false};
 };
 
@@ -551,13 +593,13 @@ public:
             }
         }
 
-        // If the ring was empty, notify after publishing the element.
-        const bool was_empty = (pos == head_.load(std::memory_order_relaxed));
-
         new (&c->storage) T(std::move(v));
         c->seq.store(pos + 1, std::memory_order_release);
 
-        if (wait_ && was_empty) wait_->cv_not_empty.notify_one();
+        // Wake consumer only if it is likely sleeping.
+        if (wait_ && wait_->sleeping.exchange(false, std::memory_order_relaxed)) {
+            wait_->sem_not_empty.release();
+        }
         return true;
     }
 
@@ -599,16 +641,21 @@ public:
             std::this_thread::sleep_for(dur);
             return;
         }
-        std::unique_lock<std::mutex> lk(wait_->m);
-        wait_->cv_not_empty.wait_for(lk, dur, [&] {
-            return wait_->stop.load(std::memory_order_relaxed);
-        });
+        // Single consumer: sleep using semaphore to reduce overhead vs condition_variable.
+        wait_->sleeping.store(true, std::memory_order_relaxed);
+        if (wait_->stop.load(std::memory_order_relaxed)) {
+            wait_->sleeping.store(false, std::memory_order_relaxed);
+            return;
+        }
+        (void)wait_->sem_not_empty.try_acquire_for(dur);
+        wait_->sleeping.store(false, std::memory_order_relaxed);
     }
 
     void signal_stop() {
         if (!wait_) return;
         wait_->stop.store(true, std::memory_order_relaxed);
-        wait_->cv_not_empty.notify_all();
+        // Wake consumer if sleeping.
+        wait_->sem_not_empty.release();
         wait_->cv_not_full.notify_all();
     }
 
@@ -686,14 +733,19 @@ public:
 
     void wait_for_data(std::chrono::milliseconds dur) {
         if (size_relaxed() > 0) return;
-        // Shared cv is notified by both rings.
-        std::unique_lock<std::mutex> lk(wait_.m);
-        wait_.cv_not_empty.wait_for(lk, dur, [&] { return wait_.stop.load(std::memory_order_relaxed) || size_relaxed() > 0; });
+        wait_.sleeping.store(true, std::memory_order_relaxed);
+        if (wait_.stop.load(std::memory_order_relaxed)) {
+            wait_.sleeping.store(false, std::memory_order_relaxed);
+            return;
+        }
+        // If producers enqueue while we're sleeping, they will release sem_not_empty.
+        (void)wait_.sem_not_empty.try_acquire_for(dur);
+        wait_.sleeping.store(false, std::memory_order_relaxed);
     }
 
     void signal_stop() {
         wait_.stop.store(true, std::memory_order_relaxed);
-        wait_.cv_not_empty.notify_all();
+        wait_.sem_not_empty.release();
         wait_.cv_not_full.notify_all();
     }
 
@@ -776,6 +828,15 @@ public:
             queue_ = std::make_unique<dual_queue<log_event>>(cfg_.async.queue_capacity);
             worker_ = std::thread([this] { worker_loop(); });
         }
+
+        // If the user explicitly opts into message-only output, default to skipping metadata
+        // capture to maximize throughput.
+        if (cfg_.pattern == "{msg}") {
+            cfg_.capture_timestamp = false;
+            cfg_.capture_thread_id = false;
+            cfg_.capture_logger_name = false;
+            cfg_.capture_source_location = false;
+        }
     }
 
     ~logger() { shutdown(); }
@@ -824,26 +885,48 @@ public:
 
     void set_flush_on(level lv) noexcept { cfg_.flush_on_level = lv; }
 
-    template <class... Args>
-    void log(level lv, std::string_view fmt, Args&&... args) {
-        log_at(lv, std::source_location::current(), fmt, std::forward<Args>(args)...);
+    template <class Fmt, class... Args>
+    void log(level lv, Fmt&& fmt, Args&&... args)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        if (static_cast<int>(lv) < static_cast<int>(cfg_.level)) return;
+        if (cfg_.capture_source_location) {
+            log_at(lv, std::source_location::current(), std::string_view(fmt), std::forward<Args>(args)...);
+        } else {
+            log_at_no_loc(lv, std::string_view(fmt), std::forward<Args>(args)...);
+        }
     }
 
+    // Fast path for compile-time checked format strings (avoids std::vformat).
     template <class... Args>
-    void log_at(level lv, const std::source_location& loc, std::string_view fmt, Args&&... args) {
+    void log(level lv, std::format_string<Args...> fmt, Args&&... args) {
+        if (static_cast<int>(lv) < static_cast<int>(cfg_.level)) return;
+        if (cfg_.capture_source_location) {
+            log_at(lv, std::source_location::current(), fmt, std::forward<Args>(args)...);
+        } else {
+            log_at_no_loc(lv, fmt, std::forward<Args>(args)...);
+        }
+    }
+
+    template <class Fmt, class... Args>
+    void log_at(level lv, const std::source_location& loc, Fmt&& fmt, Args&&... args)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
         if (static_cast<int>(lv) < static_cast<int>(cfg_.level)) return;
 
         log_event e;
-        e.ts = std::chrono::system_clock::now();
+        if (cfg_.capture_timestamp) e.ts = std::chrono::system_clock::now();
         e.lvl = lv;
-        e.tid = std::this_thread::get_id();
-        e.name = cfg_.name;
+        if (cfg_.capture_thread_id) e.tid = std::this_thread::get_id();
+        if (cfg_.capture_logger_name) e.name = cfg_.name;
         e.loc = loc;
         try {
-            e.payload = std::vformat(fmt, std::make_format_args(std::forward<Args>(args)...));
+            e.payload = detail::vformat_payload(std::string_view(fmt), std::forward<Args>(args)...);
         } catch (...) {
             // Keep logging non-fatal even if formatting fails.
-            e.payload = std::string(fmt);
+            e.payload = std::string(std::string_view(fmt));
         }
         if (single_threaded_) {
             e.seq = seq_st_++;
@@ -874,7 +957,6 @@ public:
                     stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            stats_.queue_size.store(queue_->size_relaxed(), std::memory_order_relaxed);
             return;
         }
 
@@ -884,17 +966,220 @@ public:
     }
 
     template <class... Args>
-    void trace(std::string_view f, Args&&... a) { log(level::trace, f, std::forward<Args>(a)...); }
+    void log_at(level lv, const std::source_location& loc, std::format_string<Args...> fmt, Args&&... args) {
+        if (static_cast<int>(lv) < static_cast<int>(cfg_.level)) return;
+
+        log_event e;
+        if (cfg_.capture_timestamp) e.ts = std::chrono::system_clock::now();
+        e.lvl = lv;
+        if (cfg_.capture_thread_id) e.tid = std::this_thread::get_id();
+        if (cfg_.capture_logger_name) e.name = cfg_.name;
+        e.loc = loc;
+        try {
+            e.payload = detail::format_payload(fmt, std::forward<Args>(args)...);
+        } catch (...) {
+            // Keep logging non-fatal even if formatting fails.
+            e.payload = std::string(fmt.get());
+        }
+
+        if (single_threaded_) {
+            e.seq = seq_st_++;
+            sink_batch_write_one(e);
+            ++enqueued_st_;
+            ++dequeued_st_;
+            if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+            return;
+        }
+
+        e.seq = seq_.fetch_add(1, std::memory_order_relaxed);
+
+        if (cfg_.async.enabled) {
+            const int w = level_weight(lv);
+            const bool ok = queue_->try_push(std::move(e), w);
+            if (ok) {
+                stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (cfg_.async.drop_when_full) {
+                    if (static_cast<int>(lv) >= static_cast<int>(level::warn)) {
+                        queue_->push_blocking(std::move(e), w);
+                        stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        stats_.dropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    queue_->push_blocking(std::move(e), w);
+                    stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+
+        // Sync mode
+        sink_batch_write_one(e);
+        if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+    }
+
+    template <class Fmt, class... Args>
+    void log_at_no_loc(level lv, Fmt&& fmt, Args&&... args)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        // NOTE: capture_source_location is intentionally avoided on this path.
+        log_event e;
+        if (cfg_.capture_timestamp) e.ts = std::chrono::system_clock::now();
+        e.lvl = lv;
+        if (cfg_.capture_thread_id) e.tid = std::this_thread::get_id();
+        if (cfg_.capture_logger_name) e.name = cfg_.name;
+        try {
+            e.payload = detail::vformat_payload(std::string_view(fmt), std::forward<Args>(args)...);
+        } catch (...) {
+            e.payload = std::string(std::string_view(fmt));
+        }
+
+        if (single_threaded_) {
+            e.seq = seq_st_++;
+            sink_batch_write_one(e);
+            ++enqueued_st_;
+            ++dequeued_st_;
+            if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+            return;
+        }
+
+        e.seq = seq_.fetch_add(1, std::memory_order_relaxed);
+
+        if (cfg_.async.enabled) {
+            const int w = level_weight(lv);
+            const bool ok = queue_->try_push(std::move(e), w);
+            if (ok) {
+                stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (cfg_.async.drop_when_full) {
+                    if (static_cast<int>(lv) >= static_cast<int>(level::warn)) {
+                        queue_->push_blocking(std::move(e), w);
+                        stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        stats_.dropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    queue_->push_blocking(std::move(e), w);
+                    stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+
+        sink_batch_write_one(e);
+        if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+    }
+
     template <class... Args>
-    void debug(std::string_view f, Args&&... a) { log(level::debug, f, std::forward<Args>(a)...); }
+    void log_at_no_loc(level lv, std::format_string<Args...> fmt, Args&&... args) {
+        log_event e;
+        if (cfg_.capture_timestamp) e.ts = std::chrono::system_clock::now();
+        e.lvl = lv;
+        if (cfg_.capture_thread_id) e.tid = std::this_thread::get_id();
+        if (cfg_.capture_logger_name) e.name = cfg_.name;
+        try {
+            e.payload = detail::format_payload(fmt, std::forward<Args>(args)...);
+        } catch (...) {
+            e.payload = std::string(fmt.get());
+        }
+
+        if (single_threaded_) {
+            e.seq = seq_st_++;
+            sink_batch_write_one(e);
+            ++enqueued_st_;
+            ++dequeued_st_;
+            if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+            return;
+        }
+
+        e.seq = seq_.fetch_add(1, std::memory_order_relaxed);
+
+        if (cfg_.async.enabled) {
+            const int w = level_weight(lv);
+            const bool ok = queue_->try_push(std::move(e), w);
+            if (ok) {
+                stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (cfg_.async.drop_when_full) {
+                    if (static_cast<int>(lv) >= static_cast<int>(level::warn)) {
+                        queue_->push_blocking(std::move(e), w);
+                        stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        stats_.dropped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    queue_->push_blocking(std::move(e), w);
+                    stats_.enqueued.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+
+        sink_batch_write_one(e);
+        if (static_cast<int>(lv) >= static_cast<int>(cfg_.flush_on_level)) flush();
+    }
+
     template <class... Args>
-    void info(std::string_view f, Args&&... a) { log(level::info, f, std::forward<Args>(a)...); }
+    void trace(std::format_string<Args...> f, Args&&... a) { log(level::trace, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void trace(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::trace, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
+
     template <class... Args>
-    void warn(std::string_view f, Args&&... a) { log(level::warn, f, std::forward<Args>(a)...); }
+    void debug(std::format_string<Args...> f, Args&&... a) { log(level::debug, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void debug(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::debug, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
+
     template <class... Args>
-    void error(std::string_view f, Args&&... a) { log(level::error, f, std::forward<Args>(a)...); }
+    void info(std::format_string<Args...> f, Args&&... a) { log(level::info, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void info(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::info, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
+
     template <class... Args>
-    void critical(std::string_view f, Args&&... a) { log(level::critical, f, std::forward<Args>(a)...); }
+    void warn(std::format_string<Args...> f, Args&&... a) { log(level::warn, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void warn(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::warn, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
+
+    template <class... Args>
+    void error(std::format_string<Args...> f, Args&&... a) { log(level::error, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void error(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::error, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
+
+    template <class... Args>
+    void critical(std::format_string<Args...> f, Args&&... a) { log(level::critical, f, std::forward<Args>(a)...); }
+    template <class Fmt, class... Args>
+    void critical(Fmt&& f, Args&&... a)
+        requires(std::is_convertible_v<Fmt, std::string_view> &&
+                 !(std::is_array_v<std::remove_reference_t<Fmt>> &&
+                   std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>)) {
+        log(level::critical, std::forward<Fmt>(f), std::forward<Args>(a)...);
+    }
 
     void flush() {
         if (single_threaded_) {
