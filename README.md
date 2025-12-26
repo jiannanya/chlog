@@ -1,6 +1,6 @@
 # chlog
 
-`chlog` is a ligthweight and efficiency modern **header-only** C++ logging library designed to be simple, thread-safe or single thread only, optionally async, and sink-extensible.
+`chlog` is a lightweight and efficient modern **header-only** C++ logging library designed to be simple, optionally async, and sink-extensible.
 
 - Language standard: C++20 (uses `std::format` / `std::source_location`)
 - Platforms: Windows / Linux / macOS (time formatting uses `localtime_s` on Windows)
@@ -8,8 +8,10 @@
 ## Features
 
 - **Sync / async**: toggle via `logger_config::async.enabled`.
+- **Fast async wakeups**: async queue uses a bounded MPSC ring buffer with `std::counting_semaphore`-based wakeups (reduces sleep/wakeup overhead).
 - **Single-threaded ultra-fast mode**: `logger_config::single_threaded` (not thread-safe; disables async + parallel_sinks).
 - **Bounded queue + priority dropping**: when full, prefers dropping `trace/debug/info`, while trying to keep `warn+`.
+- **Optional fmt backend**: define `CHLOG_USE_FMT=1` to format via `{fmt}` for higher throughput; default stays `std::format`.
 - **Multiple sinks**: `console_sink`, `rotating_file_sink`, `daily_file_sink`, `json_sink`.
 - **Optional parallel sinks**: `logger_config::parallel_sinks` + built-in thread pool (sync mode only).
 - **Call-site info**: built-in `std::source_location`; pattern/JSON can output `{file}` `{line}` `{func}`.
@@ -110,4 +112,84 @@ Example (enabled by default):
 
 - `chlog_stress` (built from `examples/chlog_stress.cpp`)
 - `chlog_single_thread_bench` (built from `examples/single_thread_bench.cpp`)
+
+## Benchmarks (chlog vs spdlog)
+
+This repo includes a simple benchmark executable that compares **chlog** vs **spdlog** in a tight loop,
+using an in-memory counting sink (no I/O) to focus on call-site + formatting + dispatch overhead.
+
+Note: for a fairer comparison, the benchmark enables `CHLOG_USE_FMT=1` for chlog when spdlog is available,
+so both libraries use the same formatting backend.
+
+Benchmark executable:
+
+- `chlog_bench_loggers`
+
+### Dependencies (via vcpkg)
+
+Install spdlog:
+
+```powershell
+vcpkg install spdlog
+```
+
+### Configure with vcpkg + clang
+
+Example using Ninja + clang-cl on Windows:
+
+```powershell
+$env:VCPKG_ROOT = "C:\\path\\to\\vcpkg"
+cmake -S . -B build-ninja-clang -G Ninja `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\\scripts\\buildsystems\\vcpkg.cmake" `
+    -DCMAKE_CXX_COMPILER=clang-cl
+
+cmake --build build-ninja-clang
+```
+
+### Run
+
+Iterations can be set via `--iters` or `CHLOG_BENCH_ITERS`:
+
+```powershell
+$env:CHLOG_BENCH_ITERS = "1000000"
+./build-ninja-clang/chlog_bench_loggers
+
+./build-ninja-clang/chlog_bench_loggers --iters 2000000
+```
+
+The program prints machine-parsable lines:
+
+- `RESULT runner=... case=... calls=... seconds=... cps=... processed=... dropped=...`
+
+### Generate Markdown report
+
+```powershell
+python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 1000000
+```
+
+The report includes:
+
+- CPU + total memory info
+- vcpkg versions for `spdlog` (and `fmt` if present)
+
+### Latest results
+
+![chlog vs spdlog benchmark chart](docs/logbench_summary.svg)
+
+| Case | chlog | spdlog |
+|---|---:|---:|
+| async_mt | 5.026e+06 | 4.130e+06 |
+| filtered_out | 4.510e+09 | 4.395e+08 |
+| sync_mt | 1.737e+07 | 1.695e+07 |
+| sync_st | 2.836e+07 | 2.288e+07 |
+
+Full details (including per-case tables, CPU/memory, and library versions) are in [docs/logbench_results.md](docs/logbench_results.md).
+
+### Regenerate report + chart
+
+```powershell
+python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 2000000
+python ./tools/logbench_plot.py --in docs/logbench_results.md --out docs/logbench_summary.svg
+```
   

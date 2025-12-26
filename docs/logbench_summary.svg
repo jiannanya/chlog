@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="480" viewBox="0 0 980 480">
+<rect x="0" y="0" width="100%" height="100%" fill="white" />
+<text x="90" y="35" font-family="Segoe UI, Arial" font-size="18" fill="#111">chlog vs spdlog (calls/s, log scale)</text>
+<line x1="90" y1="395.00" x2="950" y2="395.00" stroke="#e5e5e5" stroke-width="1" />
+<text x="80" y="399.00" text-anchor="end" font-family="Segoe UI, Arial" font-size="12" fill="#333">10^6</text>
+<line x1="90" y1="311.25" x2="950" y2="311.25" stroke="#e5e5e5" stroke-width="1" />
+<text x="80" y="315.25" text-anchor="end" font-family="Segoe UI, Arial" font-size="12" fill="#333">10^7</text>
+<line x1="90" y1="227.50" x2="950" y2="227.50" stroke="#e5e5e5" stroke-width="1" />
+<text x="80" y="231.50" text-anchor="end" font-family="Segoe UI, Arial" font-size="12" fill="#333">10^8</text>
+<line x1="90" y1="143.75" x2="950" y2="143.75" stroke="#e5e5e5" stroke-width="1" />
+<text x="80" y="147.75" text-anchor="end" font-family="Segoe UI, Arial" font-size="12" fill="#333">10^9</text>
+<line x1="90" y1="60.00" x2="950" y2="60.00" stroke="#e5e5e5" stroke-width="1" />
+<text x="80" y="64.00" text-anchor="end" font-family="Segoe UI, Arial" font-size="12" fill="#333">10^10</text>
+<line x1="90" y1="395" x2="950" y2="395" stroke="#333" stroke-width="1.2" />
+<line x1="90" y1="395" x2="90" y2="60" stroke="#333" stroke-width="1.2" />
+<text x="25" y="227.50" transform="rotate(-90 25,227.50)" font-family="Segoe UI, Arial" font-size="12" fill="#333">calls/s (log10 scale)</text>
+<text x="197.50" y="433" text-anchor="middle" font-family="Segoe UI, Arial" font-size="12" fill="#111">async_mt</text>
+<rect x="111.50" y="336.27" width="80.84" height="58.73" fill="#1f77b4" />
+<text x="151.92" y="330.27" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">5.026e+06</text>
+<rect x="202.66" y="343.41" width="80.84" height="51.59" fill="#ff7f0e" />
+<text x="243.08" y="337.41" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">4.130e+06</text>
+<text x="412.50" y="433" text-anchor="middle" font-family="Segoe UI, Arial" font-size="12" fill="#111">filtered_out</text>
+<rect x="326.50" y="88.96" width="80.84" height="306.04" fill="#1f77b4" />
+<text x="366.92" y="82.96" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">4.510e+09</text>
+<rect x="417.66" y="173.65" width="80.84" height="221.35" fill="#ff7f0e" />
+<text x="458.08" y="167.65" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">4.395e+08</text>
+<text x="627.50" y="433" text-anchor="middle" font-family="Segoe UI, Arial" font-size="12" fill="#111">sync_mt</text>
+<rect x="541.50" y="291.17" width="80.84" height="103.83" fill="#1f77b4" />
+<text x="581.92" y="285.17" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">1.737e+07</text>
+<rect x="632.66" y="292.06" width="80.84" height="102.94" fill="#ff7f0e" />
+<text x="673.08" y="286.06" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">1.695e+07</text>
+<text x="842.50" y="433" text-anchor="middle" font-family="Segoe UI, Arial" font-size="12" fill="#111">sync_st</text>
+<rect x="756.50" y="273.34" width="80.84" height="121.66" fill="#1f77b4" />
+<text x="796.92" y="267.34" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">2.836e+07</text>
+<rect x="847.66" y="281.15" width="80.84" height="113.85" fill="#ff7f0e" />
+<text x="888.08" y="275.15" text-anchor="middle" font-family="Consolas, Menlo, monospace" font-size="11" fill="#111">2.288e+07</text>
+<rect x="730" y="18" width="210" height="54" fill="#fff" stroke="#ddd" />
+<text x="740" y="36" font-family="Segoe UI, Arial" font-size="12" fill="#111">Runners</text>
+<rect x="740" y="43" width="12" height="12" fill="#1f77b4" />
+<text x="760" y="53" font-family="Segoe UI, Arial" font-size="12" fill="#111">chlog</text>
+<rect x="740" y="61" width="12" height="12" fill="#ff7f0e" />
+<text x="760" y="71" font-family="Segoe UI, Arial" font-size="12" fill="#111">spdlog</text>
+</svg>
