@@ -17,6 +17,20 @@
 - **Call-site info**: built-in `std::source_location`; pattern/JSON can output `{file}` `{line}` `{func}`.
 - **Robustness**: formatting failures / sink exceptions are swallowed to avoid crashing the main flow.
 
+
+### Latest results
+
+![chlog vs spdlog benchmark chart](docs/logbench_summary.svg)
+
+| Case | chlog | spdlog |
+|---|---:|---:|
+| async_mt | 5.026e+06 | 4.130e+06 |
+| filtered_out | 4.510e+09 | 4.395e+08 |
+| sync_mt | 1.737e+07 | 1.695e+07 |
+| sync_st | 2.836e+07 | 2.288e+07 |
+
+Full details (including per-case tables, CPU/memory, and library versions) are in [docs/logbench_results.md](docs/logbench_results.md).
+
 ## Quick Start
 
 ```cpp
@@ -173,18 +187,6 @@ The report includes:
 - CPU + total memory info
 - vcpkg versions for `spdlog` (and `fmt` if present)
 
-### Latest results
-
-![chlog vs spdlog benchmark chart](docs/logbench_summary.svg)
-
-| Case | chlog | spdlog |
-|---|---:|---:|
-| async_mt | 5.026e+06 | 4.130e+06 |
-| filtered_out | 4.510e+09 | 4.395e+08 |
-| sync_mt | 1.737e+07 | 1.695e+07 |
-| sync_st | 2.836e+07 | 2.288e+07 |
-
-Full details (including per-case tables, CPU/memory, and library versions) are in [docs/logbench_results.md](docs/logbench_results.md).
 
 ### Regenerate report + chart
 
