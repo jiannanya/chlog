@@ -114,6 +114,7 @@ If you want to force capturing call-site info without changing your function sig
 
 - `CHLOG_INFO(*lg, "msg {}", x)`
 - `CHLOG_ERROR(*lg, "oops {}", err)`
+- etc.
 
 ## Build with CMake
 
@@ -187,6 +188,9 @@ The report includes:
 - CPU + total memory info
 - vcpkg versions for `spdlog` (and `fmt` if present)
 
+Note:
+
+- there may defferent results between platforms
 
 ### Regenerate report + chart
 
