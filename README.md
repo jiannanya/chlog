@@ -150,14 +150,14 @@ vcpkg install spdlog
 
 ### Configure with vcpkg + clang
 
-Example using Ninja + clang-cl on Windows:
+Example using Ninja + clang on Windows:
 
 ```powershell
 $env:VCPKG_ROOT = "C:\\path\\to\\vcpkg"
 cmake -S . -B build-ninja-clang -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
     -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\\scripts\\buildsystems\\vcpkg.cmake" `
-    -DCMAKE_CXX_COMPILER=clang-cl
+    -DCMAKE_CXX_COMPILER=clang
 
 cmake --build build-ninja-clang
 ```
