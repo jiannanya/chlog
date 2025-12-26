@@ -1,6 +1,6 @@
 # chlog vs spdlog benchmark report
 
-- Executable: `D:\CS\src3\chlog\build-ninja-clang\chlog_bench_loggers.exe`
+- Executable: `chlog_bench_loggers.exe`
 - Host: `Windows-10-10.0.26100-SP0`
 - Python: `3.10.7`
 - Iterations: `2000000`
