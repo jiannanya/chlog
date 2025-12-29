@@ -1,8 +1,8 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO jiannanya/chlog
-    REF 91334614beec914b24a9b7a280478716d5fdb085
-    SHA512 2a3ad64296b1f9bfb6a95db804fb97e64370b4e9a3ded0a23e534a02ccdb9c2910a901f909f0221ed4ff27b5a941185edbb7d54f2fb4ebdf1b61049ca0b64102
+    REF v1.0.0
+    SHA512 c36fe021833bbc7de430a9cf0e7205cbc32f7f52b9d85100b204032ae9d9f4130e79cd9e53e13c67dcae0f0341da1153284e451db78df1f1a044b755c5e5562a
 )
 
 vcpkg_configure_cmake(
@@ -18,6 +18,10 @@ vcpkg_install_cmake()
 vcpkg_fixup_cmake_targets(
     CONFIG_PATH lib/cmake/chlog
 )
+
+# Header-only: remove empty lib directories created by CMake install/export.
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib")
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/lib")
 
 # Header-only: remove debug tree if produced.
 if(EXISTS "${CURRENT_PACKAGES_DIR}/debug")
