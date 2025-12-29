@@ -123,6 +123,21 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
+## Install via vcpkg
+
+Once the `chlog` port is available in your vcpkg registry (or you use this repo's overlay port under `ports/chlog`), install with:
+
+```powershell
+vcpkg install chlog
+```
+
+Consume from CMake:
+
+```cmake
+find_package(chlog CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE chlog::chlog)
+```
+
 Example (enabled by default):
 
 - `chlog_stress` (built from `examples/chlog_stress.cpp`)
