@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(chlog VERSION 0.1.0 LANGUAGES CXX)
+project(chlog VERSION 1.0.0 LANGUAGES CXX)
 
 option(CHLOG_BUILD_EXAMPLES "Build chlog examples" ON)
 option(CHLOG_BUILD_BENCHMARKS "Build chlog benchmarks" ON)
