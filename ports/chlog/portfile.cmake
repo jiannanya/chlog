@@ -2,7 +2,7 @@ vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO jiannanya/chlog
     REF v1.0.0
-    SHA512 c36fe021833bbc7de430a9cf0e7205cbc32f7f52b9d85100b204032ae9d9f4130e79cd9e53e13c67dcae0f0341da1153284e451db78df1f1a044b755c5e5562a
+    SHA512 a9c827f0c1b732a70b214746ca681c5759a71e4b759bfc95a5b0e4c8ac9b1b0b93c83e88ba0e46985d27774abe486cd15f3d93dbe253dd3024039e90f27d223d
 )
 
 vcpkg_configure_cmake(
