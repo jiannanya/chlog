@@ -3,4 +3,5 @@
 logs/
 build/
 build-*/
+_install_test/
 *.log
