@@ -1,3 +1,5 @@
+set(VCPKG_BUILD_TYPE release) # header-only library
+
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO jiannanya/chlog
@@ -21,12 +23,7 @@ vcpkg_fixup_cmake_targets(
 
 # Header-only: remove empty lib directories created by CMake install/export.
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib")
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/lib")
 
-# Header-only: remove debug tree if produced.
-if(EXISTS "${CURRENT_PACKAGES_DIR}/debug")
-    file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug")
-endif()
 
 file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/usage" DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}")
 
