@@ -1,24 +1,47 @@
 # chlog
 
-`chlog` is a lightweight and efficient modern **header-only** C++ logging library designed to be simple, optionally async, and sink-extensible.
+`chlog` is a lightweight, modern, **header-only** C++20 logging library: simple at the call site, configurable for throughput (optional async), and extensible via sinks.
 
-- Language standard: C++20 (uses `std::format` / `std::source_location`)
-- Platforms: Windows / Linux / macOS (time formatting uses `localtime_s` on Windows)
+- **C++20**: uses `std::format` and `std::source_location`
+- **Platforms**: Windows / Linux / macOS (`localtime_s` on Windows, `localtime_r` elsewhere)
 
-## Features
+> 中文一句话：`chlog` 主打“高性能、调用端轻、吞吐高、可选异步、可插拔 sink、 线程安全可选”，并且尽量把开销留在需要的时候。
 
-- **Sync / async**: toggle via `logger_config::async.enabled`.
-- **Fast async wakeups**: async queue uses a bounded MPSC ring buffer with `std::counting_semaphore`-based wakeups (reduces sleep/wakeup overhead).
-- **Single-threaded ultra-fast mode**: `logger_config::single_threaded` (not thread-safe; disables async + parallel_sinks).
-- **Bounded queue + priority dropping**: when full, prefers dropping `trace/debug/info`, while trying to keep `warn+`.
-- **Optional fmt backend**: define `CHLOG_USE_FMT=1` to format via `{fmt}` for higher throughput; default stays `std::format`.
-- **Multiple sinks**: `console_sink`, `rotating_file_sink`, `daily_file_sink`, `json_sink`.
-- **Optional parallel sinks**: `logger_config::parallel_sinks` + built-in thread pool (sync mode only).
-- **Call-site info**: built-in `std::source_location`; pattern/JSON can output `{file}` `{line}` `{func}`.
-- **Robustness**: formatting failures / sink exceptions are swallowed to avoid crashing the main flow.
+## Highlights
 
+- **Sync / async**: toggle via `logger_config::async.enabled`
+- **Fast async wakeups**: bounded MPSC ring buffer + `std::counting_semaphore`
+- **Single-threaded ultra-fast mode**: `logger_config::single_threaded` (not thread-safe; forces async + parallel_sinks off)
+- **Bounded queue + priority dropping**: prefers dropping `trace/debug/info` while keeping `warn+`
+- **Optional {fmt} backend**: define `CHLOG_USE_FMT` to use `{fmt}` for formatting (default: `std::format`)
+- **Built-in sinks**: `console_sink`, `rotating_file_sink`, `daily_file_sink`, `json_sink`
+- **Optional parallel sinks**: `logger_config::parallel_sinks` (sync mode only)
+- **Call-site info**: `std::source_location` → `{file}` `{line}` `{func}` (pattern / JSON)
+- **Robustness**: formatting failures / sink exceptions are swallowed (logging should not crash your app)
 
-### Latest results
+## Contents
+
+- [chlog](#chlog)
+  - [Highlights](#highlights)
+  - [Contents](#contents)
+  - [Latest results](#latest-results)
+  - [Quick Start](#quick-start)
+  - [Feature spotlight: message-only mode](#feature-spotlight-message-only-mode)
+    - [Example: high-throughput message-only async file logger](#example-high-throughput-message-only-async-file-logger)
+  - [Single-threaded mode (`logger_config::single_threaded`)](#single-threaded-mode-logger_configsingle_threaded)
+  - [Parallel sinks (`logger_config::parallel_sinks`)](#parallel-sinks-logger_configparallel_sinks)
+    - [Pattern](#pattern)
+    - [Macros (Optional)](#macros-optional)
+  - [Build with CMake](#build-with-cmake)
+  - [Install via vcpkg](#install-via-vcpkg)
+  - [Benchmarks (chlog vs spdlog)](#benchmarks-chlog-vs-spdlog)
+    - [Dependencies (via vcpkg)](#dependencies-via-vcpkg)
+    - [Configure with vcpkg + clang](#configure-with-vcpkg--clang)
+    - [Run](#run)
+    - [Generate Markdown report](#generate-markdown-report)
+    - [Regenerate report + chart](#regenerate-report--chart)
+
+## Latest results
 
 ![chlog vs spdlog benchmark chart](docs/logbench_summary.svg)
 
@@ -59,6 +82,53 @@ int main() {
     lg->shutdown();
 }
 ```
+
+## Feature spotlight: message-only mode
+
+If you only need the formatted message (no timestamp / thread id / logger name / source location), set:
+
+- `cfg.pattern = "{msg}";`
+
+In this mode, `chlog` automatically disables metadata capture (`capture_timestamp`, `capture_thread_id`, `capture_logger_name`, `capture_source_location`) to minimize per-call overhead. This is especially useful for hot loops (e.g., game loops, trading strategies, telemetry) where you want high throughput and you don’t need rich metadata.
+
+### Example: high-throughput message-only async file logger
+
+```cpp
+#include <chlog/chlog.hpp>
+
+#include <chrono>
+#include <memory>
+
+int main() {
+    using namespace chlog;
+
+    logger_config cfg;
+    cfg.name = "fast";
+    cfg.level = level::info;
+
+    // Feature: message-only mode disables metadata capture automatically.
+    cfg.pattern = "{msg}";
+
+    cfg.async.enabled = true;
+    cfg.async.queue_capacity = 1u << 16;
+    cfg.async.batch_max = 512;
+    cfg.async.flush_every = std::chrono::milliseconds(200);
+
+    auto lg = std::make_shared<logger>(cfg);
+    lg->add_sink(std::make_shared<rotating_file_sink>("logs/fast.log", 8 * 1024 * 1024, 3));
+
+    for (int i = 0; i < 100000; ++i) {
+        lg->info("tick {}", i);
+    }
+
+    lg->shutdown();
+}
+```
+
+Notes:
+
+- If you need any metadata, use a pattern token (e.g. `[{lvl}] {msg}` or `[{date} {time}.{ms}] {msg}`) and keep the corresponding `capture_*` flags enabled.
+- If you want structured output, prefer `{json}` (see “Pattern”).
 
 ## Single-threaded mode (`logger_config::single_threaded`)
 
@@ -148,7 +218,7 @@ Example (enabled by default):
 This repo includes a simple benchmark executable that compares **chlog** vs **spdlog** in a tight loop,
 using an in-memory counting sink (no I/O) to focus on call-site + formatting + dispatch overhead.
 
-Note: for a fairer comparison, the benchmark enables `CHLOG_USE_FMT=1` for chlog when spdlog is available,
+Note: for a fairer comparison, the benchmark enables `CHLOG_USE_FMT` for chlog when spdlog is available,
 so both libraries use the same formatting backend.
 
 Benchmark executable:
@@ -205,7 +275,7 @@ The report includes:
 
 Note:
 
-- there may defferent results between platforms
+- results may differ between platforms
 
 ### Regenerate report + chart
 
