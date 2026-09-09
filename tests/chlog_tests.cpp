@@ -46,6 +46,16 @@ struct counter_sink : chlog::sink {
     void flush() override { ++flushes; }
 };
 
+struct recording_view_sink : chlog::view_sink {
+    std::mutex mutex;
+    std::vector<chlog::log_event> events;
+    unsigned required_metadata() const noexcept override { return all_metadata; }
+    void consume(const chlog::log_event_view& e) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        events.push_back(e.own());
+    }
+};
+
 struct blocked_sink : counter_sink {
     std::binary_semaphore entered{0}, proceed{0};
     void log(const chlog::log_event&) override {
@@ -64,6 +74,46 @@ chlog::logger_config config() {
 }
 
 void formatting() {
+    for (int mode = 0; mode < 4; ++mode) {
+        auto view_cfg = config();
+        view_cfg.single_threaded = mode == 0;
+        view_cfg.async.enabled = mode == 2;
+        view_cfg.parallel_sinks = mode == 3;
+        chlog::logger viewed(view_cfg);
+        auto captured = std::make_shared<recording_view_sink>(); viewed.add_sink(captured);
+        std::string input(4096, 'x'); input[17] = '\0';
+        const auto expected = input;
+        CHLOG_INFO(viewed, "{}", input);
+        input.assign("changed");
+        viewed.info("custom {}", custom_value{19});
+        viewed.info("escaped {{braces}}");
+        viewed.info(std::string_view("broken {"), 1);
+        viewed.log_raw(chlog::level::info, "{literal}");
+        viewed.flush();
+        CHECK(captured->events.size() == 5);
+        CHECK(captured->events.at(0).payload == expected);
+        CHECK(captured->events.at(0).name == view_cfg.name);
+        CHECK(captured->events.at(0).loc.line() != 0);
+        CHECK(captured->events.at(1).payload == "custom 19");
+        CHECK(captured->events.at(2).payload == "escaped {braces}");
+        CHECK(captured->events.at(3).payload == "broken {");
+        CHECK(captured->events.at(4).payload == "{literal}");
+        CHECK(viewed.stats().errors == 1 && viewed.stats().dequeued == 5);
+        // Adding a legacy sink changes dispatch without changing either API.
+        auto legacy = std::make_shared<recording_sink>(); viewed.add_sink(legacy);
+        viewed.info("mixed sinks"); viewed.shutdown();
+        CHECK(legacy->events.at(0).payload == "mixed sinks");
+        CHECK(captured->events.at(5).payload == "mixed sinks");
+    }
+    // Standalone sinks must render the default before any set_pattern call.
+    recording_sink standalone;
+    chlog::log_event standalone_event;
+    standalone_event.name = "standalone";
+    standalone_event.payload = "default pattern";
+    standalone_event.lvl = chlog::level::info;
+    CHECK(standalone.format(standalone_event).find("[INFO][standalone] default pattern") != std::string::npos);
+    standalone.set_thread_safe(false);
+    CHECK(standalone.format(standalone_event).find("[INFO][standalone] default pattern") != std::string::npos);
     auto cfg = config();
     cfg.single_threaded = true;
     chlog::logger logger(cfg);
@@ -403,27 +453,46 @@ void file_tests() {
 }
 
 void concurrent_tests() {
-    for (int round = 0; round < 12; ++round) {
-        auto cfg = config(); cfg.async.enabled = true; cfg.async.queue_capacity = 4;
-        cfg.async.drop_when_full = false; cfg.async.batch_max = 1;
+    for (int mode = 0; mode < 3; ++mode) {
+        for (int round = 0; round < 12; ++round) {
+            auto cfg = config(); cfg.async.enabled = mode == 1; cfg.parallel_sinks = mode == 2;
+            cfg.async.queue_capacity = 4;
+            cfg.async.drop_when_full = false; cfg.async.batch_max = 1;
+            chlog::logger logger(cfg);
+            auto output = std::make_shared<counter_sink>(); logger.add_sink(output);
+            std::atomic<int> started{0};
+            std::vector<std::thread> producers;
+            for (int t = 0; t < 6; ++t) producers.emplace_back([&] {
+                ++started;
+                for (int i = 0; i < 1000; ++i) logger.warn("{}", i);
+            });
+            while (started != 6) std::this_thread::yield();
+            auto first = std::async(std::launch::async, [&] { logger.shutdown(); });
+            auto second = std::async(std::launch::async, [&] { logger.shutdown(); });
+            for (auto& producer : producers) producer.join();
+            CHECK(first.wait_for(5s) == std::future_status::ready);
+            CHECK(second.wait_for(5s) == std::future_status::ready);
+            first.get(); second.get();
+            CHECK(logger.stats().enqueued == output->count);
+            CHECK(logger.stats().dequeued == output->count);
+            CHECK(logger.stats().queue_size == 0);
+        }
+    }
+    for (const bool async : {false, true}) {
+        auto cfg = config(); cfg.async.enabled = async; cfg.async.drop_when_full = false;
         chlog::logger logger(cfg);
-        auto output = std::make_shared<counter_sink>(); logger.add_sink(output);
-        std::atomic<int> started{0};
+        auto output = std::make_shared<recording_sink>(); logger.add_sink(output);
         std::vector<std::thread> producers;
-        for (int t = 0; t < 6; ++t) producers.emplace_back([&] {
-            ++started;
-            for (int i = 0; i < 1000; ++i) logger.warn("{}", i);
+        for (int t = 0; t < 4; ++t) producers.emplace_back([&] {
+            for (int i = 0; i < 1000; ++i) logger.info("sequence {}", i);
         });
-        while (started != 6) std::this_thread::yield();
-        auto first = std::async(std::launch::async, [&] { logger.shutdown(); });
-        auto second = std::async(std::launch::async, [&] { logger.shutdown(); });
         for (auto& producer : producers) producer.join();
-        CHECK(first.wait_for(5s) == std::future_status::ready);
-        CHECK(second.wait_for(5s) == std::future_status::ready);
-        first.get(); second.get();
-        CHECK(logger.stats().enqueued == output->count);
-        CHECK(logger.stats().dequeued == output->count);
-        CHECK(logger.stats().queue_size == 0);
+        logger.shutdown();
+        std::set<std::uint64_t> sequences;
+        for (const auto& event : output->events) sequences.insert(event.seq);
+        CHECK(sequences.size() == 4000);
+        CHECK(*sequences.begin() == 0 && *sequences.rbegin() == 3999);
+        CHECK(logger.stats().enqueued == 4000 && logger.stats().dequeued == 4000);
     }
     auto cfg = config();
     chlog::logger logger(cfg);
@@ -508,6 +577,23 @@ void configuration_tests() {
 }
 
 void registration_tests() {
+    {
+        auto cfg = config(); cfg.single_threaded = true;
+        chlog::logger logger(cfg);
+        std::vector<std::shared_ptr<recording_sink>> outputs;
+        for (int i = 0; i < 8; ++i) {
+            outputs.push_back(std::make_shared<recording_sink>());
+            logger.add_sink(outputs.back());
+            logger.info("registration {}", i);
+        }
+        logger.set_pattern("[{lvl}] {msg}");
+        logger.info("complete"); logger.shutdown();
+        for (std::size_t i = 0; i < outputs.size(); ++i) {
+            CHECK(outputs[i]->events.size() == 9 - i);
+            CHECK(outputs[i]->lines.back() == "[INFO] complete");
+        }
+        CHECK(logger.stats().enqueued == 9 && logger.stats().dequeued == 9);
+    }
     std::weak_ptr<counter_sink> lifetime;
     {
         chlog::logger logger(config());

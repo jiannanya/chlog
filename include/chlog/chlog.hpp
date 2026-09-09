@@ -39,6 +39,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+    #include <immintrin.h>
+#endif
+
 #if defined(CHLOG_USE_FMT)
     #include <fmt/format.h>
 #else
@@ -48,6 +52,23 @@
 namespace chlog {
 
 namespace detail {
+
+// Configuration locks are cold and do not need a platform mutex per object.
+// Atomic waiting parks contending threads without retaining a spinning waiter.
+class compact_mutex {
+public:
+    void lock() noexcept {
+        while (locked_.exchange(true, std::memory_order_acquire))
+            locked_.wait(true, std::memory_order_relaxed);
+    }
+    void unlock() noexcept {
+        locked_.store(false, std::memory_order_release);
+        locked_.notify_one();
+    }
+private:
+    // Some standard libraries retain a four-byte atomic_flag for ABI reasons.
+    std::atomic<bool> locked_{false};
+};
 
 #if defined(CHLOG_USE_FMT)
 template <class... Args> using format_string = fmt::format_string<Args...>;
@@ -179,6 +200,18 @@ struct log_event {
     std::uint64_t seq{};
 
     std::source_location loc{};
+};
+
+// Views are valid only during the sink callback. Copy to log_event to retain a
+// record beyond that callback; asynchronous and parallel dispatch still own data.
+struct log_event_view {
+    std::chrono::system_clock::time_point ts{};
+    level lvl{};
+    std::thread::id tid{};
+    std::string_view name, payload;
+    std::uint64_t seq{};
+    std::source_location loc{};
+    log_event own() const { return {ts, lvl, tid, std::string(name), std::string(payload), seq, loc}; }
 };
 
 namespace detail {
@@ -436,17 +469,23 @@ public:
 // =========================== Sink Interface ===========================
 
 class sink {
+    enum class pattern_kind : unsigned char { default_pattern, message, json, compiled };
 public:
     enum metadata : unsigned { timestamp = 1, thread_id = 2, logger_name = 4, source_location = 8, all_metadata = 15 };
+    sink() = default;
+    explicit sink(std::string pattern) : pattern_() { set_pattern(std::move(pattern)); }
     virtual ~sink() = default;
     virtual void set_pattern(std::string pat) {
-        std::lock_guard<std::mutex> lock(pattern_mutex_);
-        auto compiled = std::make_shared<const detail::compiled_pattern>(pat);
+        std::lock_guard<detail::compact_mutex> lock(pattern_mutex_);
+        const auto kind = pat == "{msg}" ? pattern_kind::message
+                        : pat == "{json}" ? pattern_kind::json : pattern_kind::compiled;
+        auto compiled = kind == pattern_kind::compiled
+            ? std::make_shared<const detail::compiled_pattern>(pat) : nullptr;
         // pattern_ remains available to derived sinks. Custom sinks reading it directly
         // must synchronize those reads with set_pattern themselves.
-        pattern_ = std::move(pat);
-        compiled_st_ = compiled.get();
-        compiled_.store(std::move(compiled), std::memory_order_release);
+        pattern_.swap(pat); // Release the previous string's unused capacity.
+        compiled_ = std::move(compiled);
+        pattern_kind_.store(kind, std::memory_order_release);
     }
     virtual void set_level(level lv) { level_.store(lv, std::memory_order_relaxed); }
     // Configure before publishing the sink to logging threads.
@@ -455,6 +494,9 @@ public:
     // Override when a sink needs metadata even with a message-only pattern.
     virtual unsigned required_metadata() const noexcept { return 0; }
     virtual void log(const log_event& e) = 0;
+    // Existing sinks retain their owning-event callback without modification.
+    virtual void log_view(const log_event_view& e) { log(e.own()); }
+    virtual bool uses_views() const noexcept { return false; }
     virtual void flush() {}
 
 protected:
@@ -467,14 +509,48 @@ protected:
         return e.lvl != level::off && threshold != level::off && e.lvl >= threshold;
     }
     std::string render(const log_event& e) const {
-        if (!thread_safe_) return compiled_st_->render(e);
-        return compiled_.load(std::memory_order_acquire)->render(e);
+        for (;;) {
+            switch (pattern_kind_.load(std::memory_order_acquire)) {
+                case pattern_kind::message: return e.payload;
+                case pattern_kind::json: return detail::render_json(e);
+                case pattern_kind::default_pattern: return default_pattern()->render(e);
+                case pattern_kind::compiled: {
+                    if (!thread_safe_) return compiled_->render(e);
+                    std::shared_ptr<const detail::compiled_pattern> compiled;
+                    {
+                        std::lock_guard<detail::compact_mutex> lock(pattern_mutex_);
+                        compiled = compiled_;
+                    }
+                    if (compiled) return compiled->render(e);
+                    // A simple pattern replaced the snapshot before the lock.
+                    break;
+                }
+            }
+        }
     }
 private:
-    std::mutex pattern_mutex_;
-    std::atomic<std::shared_ptr<const detail::compiled_pattern>> compiled_{
-        std::make_shared<const detail::compiled_pattern>(pattern_)};
-    const detail::compiled_pattern* compiled_st_ = compiled_.load(std::memory_order_relaxed).get();
+    std::shared_ptr<const detail::compiled_pattern> default_pattern() const {
+        std::lock_guard<detail::compact_mutex> lock(pattern_mutex_);
+        if (!compiled_)
+            compiled_ = std::make_shared<const detail::compiled_pattern>("[{date} {time}.{ms}][{lvl}][{name}] {msg}");
+        return compiled_;
+    }
+    mutable detail::compact_mutex pattern_mutex_;
+    std::atomic<pattern_kind> pattern_kind_{pattern_kind::default_pattern};
+    // Most sinks receive their logger's pattern before first use. Compile the
+    // standalone default only when rendering actually needs it.
+    mutable std::shared_ptr<const detail::compiled_pattern> compiled_;
+};
+
+// Implement consume() for synchronous inspection without an owning string copy.
+// The same callback also works with owned async and parallel events.
+class view_sink : public sink {
+public:
+    view_sink() : sink("{msg}") {}
+    bool uses_views() const noexcept override { return true; }
+    void log(const log_event& e) override { consume({e.ts, e.lvl, e.tid, e.name, e.payload, e.seq, e.loc}); }
+    void log_view(const log_event_view& e) override { consume(e); }
+    virtual void consume(const log_event_view& e) = 0;
 };
 
 class console_sink : public sink {
@@ -684,6 +760,17 @@ struct queue_wait {
     }
     template <class Ready>
     void wait_for_data(std::chrono::milliseconds duration, Ready ready) {
+        // Briefly bridge gaps between active producers before parking the
+        // consumer. The bounded pause ends quickly when the logger is idle;
+        // the semaphore handshake below still handles every sleep transition.
+        for (unsigned retry = 0; retry < 32 && duration.count() > 0; ++retry) {
+            if (ready() || stop.load(std::memory_order_acquire)) return;
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+            _mm_pause();
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+        }
         sleeping.exchange(true, std::memory_order_acq_rel);
         if (ready() || stop.load(std::memory_order_acquire)) {
             // A producer may already own a pending release. Consume it before
@@ -961,22 +1048,33 @@ class logger {
         !(std::is_array_v<std::remove_reference_t<Fmt>> &&
           std::is_same_v<std::remove_cv_t<std::remove_extent_t<std::remove_reference_t<Fmt>>>, char>);
 public:
-    explicit logger(logger_config cfg) : cfg_(std::move(cfg)), single_threaded_(cfg_.single_threaded),
-        level_(cfg_.level), flush_level_(cfg_.flush_on_level) {
-        if (single_threaded_) {
-            cfg_.async.enabled = false;
-            cfg_.parallel_sinks = false;
-        }
-        capture_mask_.store(configured_metadata(), std::memory_order_relaxed);
-        capture_mask_st_ = configured_metadata();
-        if (cfg_.async.enabled) {
-            queue_ = std::make_unique<dual_queue<detail::queued_event>>(cfg_.async.queue_capacity, cfg_.async.weighted_queue);
-            cfg_.async.batch_max = std::clamp<std::size_t>(cfg_.async.batch_max, 1, queue_->capacity());
-            batch_.reserve(cfg_.async.batch_max);
-            worker_ = std::thread([this] { worker_loop(); });
+    explicit logger(logger_config cfg)
+        : name_(std::move(cfg.name)), pattern_(std::move(cfg.pattern)),
+          level_(cfg.level), flush_level_(cfg.flush_on_level),
+          allowed_metadata_(static_cast<unsigned char>((cfg.capture_timestamp ? sink::timestamp : 0u) |
+                            (cfg.capture_thread_id ? sink::thread_id : 0u) |
+                            (cfg.capture_logger_name ? sink::logger_name : 0u) |
+                            (cfg.capture_source_location ? sink::source_location : 0u))),
+          single_threaded_(cfg.single_threaded) {
+        pattern_.shrink_to_fit();
+        capture_mask_.store(static_cast<unsigned char>(configured_metadata()), std::memory_order_relaxed);
+        if (!single_threaded_ && cfg.async.enabled) {
+            async_ = std::make_unique<async_state>(cfg.async);
+            queue_ = async_->queue.get();
+            async_->worker = std::thread([this] { worker_loop(); });
+        } else if (!single_threaded_ && cfg.parallel_sinks) {
+            parallel_ = std::make_unique<parallel_state>(cfg.sink_pool_size, cfg.sink_queue_capacity);
         }
     }
-    ~logger() { shutdown(); }
+    ~logger() {
+        shutdown();
+        auto* node = first_sink_.next.load(std::memory_order_relaxed);
+        while (node) {
+            auto* next = node->next.load(std::memory_order_relaxed);
+            delete node;
+            node = next;
+        }
+    }
     logger(const logger&) = delete;
     logger& operator=(const logger&) = delete;
 
@@ -984,51 +1082,47 @@ public:
         if (!s) throw std::invalid_argument("chlog: null sink");
         call_guard active(*this);
         if (!active) return;
-        std::lock_guard<std::mutex> lk(sinks_mu_);
-        s->set_pattern(cfg_.pattern);
+        std::lock_guard<detail::compact_mutex> lk(sinks_mu_);
+        s->set_pattern(pattern_);
         s->set_thread_safe(!single_threaded_);
-        required_metadata_ |= s->required_metadata();
+        if (!s->uses_views()) views_only_.store(false, std::memory_order_release);
+        required_metadata_ |= static_cast<unsigned char>(s->required_metadata());
         update_metadata();
-        if (single_threaded_) { sinks_st_.push_back(std::move(s)); return; }
-        auto node = std::make_unique<sink_node>(std::move(s), sink_nodes_.size() + 1);
-        if (!cfg_.async.enabled && cfg_.parallel_sinks && !pool_) {
-            pool_ = std::make_unique<thread_pool>(cfg_.sink_pool_size ? cfg_.sink_pool_size : node->count,
-                                                 cfg_.sink_queue_capacity);
-            published_pool_.store(pool_.get(), std::memory_order_release);
+        auto* previous = sinks_tail_.load(std::memory_order_relaxed);
+        auto node = previous ? std::make_unique<sink_node>(std::move(s), previous->count + 1) : nullptr;
+        auto* added = node ? node.get() : &first_sink_;
+        if (parallel_ && !parallel_->pool) {
+            parallel_->pool = std::make_unique<thread_pool>(parallel_->pool_size ? parallel_->pool_size : added->count,
+                                                          parallel_->capacity);
+            parallel_->published.store(parallel_->pool.get(), std::memory_order_release);
         }
-        auto* added = node.get();
-        sink_nodes_.push_back(std::move(node));
-        if (auto* previous = sinks_tail_.load(std::memory_order_relaxed))
-            previous->next.store(added, std::memory_order_release);
-        else sinks_head_ = added;
+        if (previous) {
+            previous->next.store(node.release(), std::memory_order_release);
+        } else first_sink_.output = std::move(s);
         sinks_tail_.store(added, std::memory_order_release);
     }
     void set_level(level lv) noexcept {
-        if (single_threaded_) cfg_.level = lv;
-        else level_.store(lv, std::memory_order_relaxed);
+        level_.store(lv, std::memory_order_relaxed);
     }
     bool should_log(level lv) const noexcept {
-        if (single_threaded_) return lv >= cfg_.level && lv != level::off && !stopped_st_;
+        if (single_threaded_) return lv >= level_.load(std::memory_order_relaxed) && lv != level::off && !shutdown_done_;
         const auto threshold = level_.load(std::memory_order_relaxed);
         return lv >= threshold && lv != level::off &&
-               !(calls_.load(std::memory_order_relaxed) & closed_bit);
+               !(counters().entries.load(std::memory_order_relaxed) & closed_bit);
     }
     void set_pattern(std::string pat) {
         call_guard active(*this);
         if (!active) return;
-        std::lock_guard<std::mutex> lk(sinks_mu_);
-        cfg_.pattern = std::move(pat);
+        std::lock_guard<detail::compact_mutex> lk(sinks_mu_);
+        pattern_.swap(pat);
         // Enable newly required fields before publishing sink patterns.
         update_metadata();
-        if (single_threaded_) {
-            for (auto& s : sinks_st_) s->set_pattern(cfg_.pattern);
-        } else if (auto current = current_sinks()) {
-            for (auto& s : current) s->set_pattern(cfg_.pattern);
+        if (auto current = current_sinks()) {
+            for (auto& s : current) s->set_pattern(pattern_);
         }
     }
     void set_flush_on(level lv) noexcept {
-        if (single_threaded_) cfg_.flush_on_level = lv;
-        else flush_level_.store(lv, std::memory_order_relaxed);
+        flush_level_.store(lv, std::memory_order_relaxed);
     }
 
     template <class... Args>
@@ -1066,6 +1160,7 @@ public:
     void log_raw(level lv, std::string_view message,
                  const std::source_location& loc = std::source_location::current()) {
         if (!should_log(lv)) return;
+        if (inline_dispatch()) { submit_view(lv, loc, message); return; }
         submit(lv, loc, [&] { return std::string(message); }, message);
     }
 
@@ -1138,23 +1233,24 @@ public:
             // A count alone is insufficient because high-priority records can overtake lows.
             const auto target = queue_->tails();
             for (;;) {
-                const auto epoch = progress_.load(std::memory_order_acquire);
-                if (reached(completed_hi_.load(std::memory_order_acquire), target.hi) &&
-                    reached(completed_lo_.load(std::memory_order_acquire), target.lo)) break;
-                progress_.wait(epoch, std::memory_order_acquire);
+                const auto epoch = async_->progress.load(std::memory_order_acquire);
+                if (reached(async_->completed_hi.load(std::memory_order_acquire), target.hi) &&
+                    reached(async_->completed_lo.load(std::memory_order_acquire), target.lo)) break;
+                async_->progress.wait(epoch, std::memory_order_acquire);
             }
         }
-        if (auto* pool = published_pool_.load(std::memory_order_acquire)) pool->wait_idle();
+        if (auto* pool = current_pool()) pool->wait_idle();
         flush_sinks();
     }
     void shutdown() {
         if (single_threaded_) {
-            if (!stopped_st_) { stopped_st_ = true; flush_sinks(); }
+            if (!shutdown_done_) { shutdown_done_ = true; flush_sinks(); }
             return;
         }
-        std::lock_guard<std::mutex> join(shutdown_mu_);
+        std::lock_guard<detail::compact_mutex> join(shutdown_mu_);
         if (shutdown_done_) return;
         calls_.fetch_or(closed_bit, std::memory_order_acq_rel);
+        const auto submitted = counters().entries.fetch_or(closed_bit, std::memory_order_seq_cst);
         // Cancel blocked queue submissions before waiting for their guards.
         if (queue_) queue_->signal_stop();
         for (;;) {
@@ -1162,27 +1258,34 @@ public:
             if (active == closed_bit) break;
             calls_.wait(active, std::memory_order_acquire);
         }
-        worker_stop_.store(true, std::memory_order_release);
-        if (queue_) queue_->signal_stop();
-        if (worker_.joinable()) worker_.join();
-        if (pool_) pool_->shutdown();
+        for (;;) {
+            const auto completed = counters().returns.load(std::memory_order_seq_cst);
+            if (completed == submitted) break;
+            counters().returns.wait(completed, std::memory_order_acquire);
+        }
+        if (async_) {
+            async_->stop.store(true, std::memory_order_release);
+            queue_->signal_stop();
+            if (async_->worker.joinable()) async_->worker.join();
+        }
+        if (parallel_ && parallel_->pool) parallel_->pool->shutdown();
         flush_sinks();
         shutdown_done_ = true;
     }
     metrics_snapshot stats() const {
-        if (single_threaded_)
-            return {dropped_st_, seq_st_, dequeued_st_, flushed_st_, 0, errors_st_};
         metrics_snapshot result;
-        result.dropped = stats_.dropped.load(std::memory_order_relaxed);
+        result.dropped = async_ ? async_->dropped.load(std::memory_order_relaxed) : 0;
         if (queue_) {
             const auto accepted = queue_->tails();
             result.enqueued = accepted.hi + accepted.lo;
-        } else result.enqueued = static_cast<std::size_t>(seq_.load(std::memory_order_acquire));
-        result.dequeued = stats_.dequeued.load(std::memory_order_acquire);
-        result.flushed = stats_.flushed.load(std::memory_order_relaxed);
-        result.errors = stats_.errors.load(std::memory_order_relaxed);
+        } else result.enqueued = static_cast<std::size_t>(counters().entries.load(std::memory_order_acquire) & ~closed_bit);
+        result.dequeued = async_ ? async_->dequeued.load(std::memory_order_acquire)
+            : parallel_ ? parallel_->dequeued.load(std::memory_order_acquire)
+            : static_cast<std::size_t>(counters().returns.load(std::memory_order_acquire));
+        result.flushed = static_cast<std::size_t>(flushed_.load(std::memory_order_relaxed));
+        result.errors = static_cast<std::size_t>(errors_.load(std::memory_order_relaxed));
         if (queue_) result.queue_size = queue_->size_relaxed();
-        else if (auto* pool = published_pool_.load(std::memory_order_acquire)) result.queue_size = pool->queue_size();
+        else if (auto* pool = current_pool()) result.queue_size = pool->queue_size();
         return result;
     }
     std::size_t queue_capacity() const noexcept { return queue_ ? queue_->capacity() : 0; }
@@ -1197,11 +1300,11 @@ private:
         std::atomic<sink_node*> next{nullptr};
     };
     struct sink_snapshot {
-        sink_node* first = nullptr;
-        sink_node* last = nullptr;
+        const sink_node* first = nullptr;
+        const sink_node* last = nullptr;
         struct iterator {
-            sink_node* node;
-            sink_node* last;
+            const sink_node* node;
+            const sink_node* last;
             const std::shared_ptr<sink>& operator*() const noexcept { return node->output; }
             iterator& operator++() noexcept {
                 node = node == last ? nullptr : node->next.load(std::memory_order_acquire);
@@ -1218,13 +1321,41 @@ private:
     sink_snapshot current_sinks() const noexcept {
         auto* last = sinks_tail_.load(std::memory_order_acquire);
         // The tail's release publishes head and every link through this tail.
-        return last ? sink_snapshot{sinks_head_, last} : sink_snapshot{};
+        return last ? sink_snapshot{&first_sink_, last} : sink_snapshot{};
     }
+    struct log_counters {
+        std::atomic<std::uint64_t> entries{0}, returns{0};
+    };
     static constexpr std::uint64_t closed_bit = std::uint64_t{1} << 63;
+    class log_guard {
+    public:
+        explicit log_guard(logger& owner) {
+            if (owner.single_threaded_) { entered_ = !owner.shutdown_done_; return; }
+            counters_ = &owner.counters();
+            sequence = counters_->entries.fetch_add(1, std::memory_order_acquire);
+            if (sequence & closed_bit) counters_->entries.fetch_sub(1, std::memory_order_relaxed);
+            else entered_ = true;
+        }
+        ~log_guard() {
+            if (!entered_ || !counters_) return;
+            // SC order prevents a missed shutdown notification: either shutdown
+            // observes this return, or this return observes the closed gate.
+            counters_->returns.fetch_add(1, std::memory_order_seq_cst);
+            if (counters_->entries.load(std::memory_order_seq_cst) & closed_bit)
+                counters_->returns.notify_all();
+        }
+        explicit operator bool() const noexcept { return entered_; }
+        log_guard(const log_guard&) = delete;
+        log_guard& operator=(const log_guard&) = delete;
+        std::uint64_t sequence = 0;
+    private:
+        log_counters* counters_ = nullptr;
+        bool entered_ = false;
+    };
     class call_guard {
     public:
         explicit call_guard(logger& owner) : owner_(&owner) {
-            if (owner.single_threaded_) { entered_ = !owner.stopped_st_; return; }
+            if (owner.single_threaded_) { entered_ = !owner.shutdown_done_; return; }
             const auto value = owner.calls_.fetch_add(1, std::memory_order_acquire);
             if (value & closed_bit) {
                 owner.calls_.fetch_sub(1, std::memory_order_release);
@@ -1247,67 +1378,127 @@ private:
         bool entered_ = false;
     };
     unsigned configured_metadata() const noexcept {
-        return allowed_metadata() & (cfg_.pattern == "{msg}" ? required_metadata_ : sink::all_metadata);
+        return allowed_metadata() & (pattern_ == "{msg}" ? static_cast<unsigned>(required_metadata_)
+                                                        : static_cast<unsigned>(sink::all_metadata));
     }
-    unsigned allowed_metadata() const noexcept {
-        return (cfg_.capture_timestamp ? sink::timestamp : 0u) |
-               (cfg_.capture_thread_id ? sink::thread_id : 0u) |
-               (cfg_.capture_logger_name ? sink::logger_name : 0u) |
-               (cfg_.capture_source_location ? sink::source_location : 0u);
-    }
+    unsigned allowed_metadata() const noexcept { return allowed_metadata_; }
     void update_metadata() noexcept {
-        capture_mask_st_ = configured_metadata();
-        capture_mask_.store(capture_mask_st_, std::memory_order_release);
+        capture_mask_.store(static_cast<unsigned char>(configured_metadata()), std::memory_order_release);
     }
     bool should_flush(level lv) const noexcept {
-        const auto threshold = single_threaded_ ? cfg_.flush_on_level : flush_level_.load(std::memory_order_relaxed);
+        const auto threshold = flush_level_.load(std::memory_order_relaxed);
         return threshold != level::off && lv >= threshold;
     }
     void error() noexcept {
-        if (single_threaded_) ++errors_st_;
-        else stats_.errors.fetch_add(1, std::memory_order_relaxed);
+        if (single_threaded_) increment_local(errors_);
+        else errors_.fetch_add(1, std::memory_order_relaxed);
     }
     template <class... Args>
     void submit_format(level lv, const std::source_location& loc, detail::format_string<Args...> fmt, Args&&... args) {
+        if (inline_dispatch()) {
+            const auto text = detail::format_view<Args...>(fmt);
+            if constexpr (sizeof...(Args) == 0) {
+                if (text.find_first_of("{}") == std::string_view::npos) {
+                    submit_view(lv, loc, text);
+                    return;
+                }
+            }
+            submit_formatted_view(lv, loc, text, [&](auto& buffer) {
+#if defined(CHLOG_USE_FMT)
+                fmt::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
+#else
+                std::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
+#endif
+            });
+            return;
+        }
         submit(lv, loc, [&] { return detail::format_payload(fmt, std::forward<Args>(args)...); },
                detail::format_view<Args...>(fmt));
     }
     template <class... Args>
     void submit_runtime(level lv, const std::source_location& loc, std::string_view fmt, Args&&... args) {
+        if (inline_dispatch()) {
+            if constexpr (sizeof...(Args) == 0) {
+                if (fmt.find_first_of("{}") == std::string_view::npos) { submit_view(lv, loc, fmt); return; }
+            }
+            submit_formatted_view(lv, loc, fmt, [&](auto& buffer) {
+#if defined(CHLOG_USE_FMT)
+                fmt::vformat_to(std::back_inserter(buffer), fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
+#else
+                std::vformat_to(std::back_inserter(buffer), fmt, std::make_format_args(args...));
+#endif
+            });
+            return;
+        }
         submit(lv, loc, [&] { return detail::vformat_payload(fmt, std::forward<Args>(args)...); }, fmt);
+    }
+    bool inline_dispatch() const noexcept {
+        return !queue_ && !parallel_ && views_only_.load(std::memory_order_acquire);
+    }
+    template <class Format>
+    void submit_formatted_view(level lv, const std::source_location& loc, std::string_view fallback, Format format) {
+        log_guard active(*this);
+        if (!active) return;
+#if defined(CHLOG_USE_FMT)
+        fmt::basic_memory_buffer<char, 250> buffer;
+#else
+        std::string buffer;
+#endif
+        std::string_view message = fallback;
+        try { format(buffer); message = {buffer.data(), buffer.size()}; }
+        catch (...) { error(); }
+        dispatch_view(lv, loc, message, active.sequence);
+    }
+    void submit_view(level lv, const std::source_location& loc, std::string_view message) {
+        log_guard active(*this);
+        if (active) dispatch_view(lv, loc, message, active.sequence);
+    }
+    void dispatch_view(level lv, const std::source_location& loc, std::string_view message, std::uint64_t sequence) {
+        log_event_view e;
+        const auto capture = capture_mask_.load(std::memory_order_acquire);
+        if (capture & sink::timestamp) e.ts = std::chrono::system_clock::now();
+        if (capture & sink::thread_id) e.tid = std::this_thread::get_id();
+        if (capture & sink::logger_name) e.name = name_;
+        if (capture & sink::source_location) e.loc = loc;
+        e.lvl = lv;
+        e.payload = message;
+        e.seq = single_threaded_ ? increment_local(counters().entries) : sequence;
+        if (single_threaded_) { write_to(current_sinks(), e); increment_local(counters().returns); }
+        else if (auto current = current_sinks()) write_to(current, e);
+        if (should_flush(lv)) flush_sinks();
     }
     template <class Format>
     void submit(level lv, const std::source_location& loc, Format format, std::string_view fallback) {
-        call_guard active(*this);
+        log_guard active(*this);
         if (!active) return;
         log_event e;
-        const auto capture = single_threaded_ ? capture_mask_st_ : capture_mask_.load(std::memory_order_acquire);
+        const auto capture = capture_mask_.load(std::memory_order_acquire);
         if (capture & sink::timestamp) e.ts = std::chrono::system_clock::now();
         if (capture & sink::thread_id) e.tid = std::this_thread::get_id();
-        if ((capture & sink::logger_name) && !queue_) e.name = cfg_.name;
+        if ((capture & sink::logger_name) && !queue_) e.name = name_;
         if (capture & sink::source_location) e.loc = loc;
         e.lvl = lv;
         try { e.payload = format(); }
         catch (...) { error(); e.payload = fallback; }
         if (single_threaded_) {
-            e.seq = seq_st_++;
-            write_to(sinks_st_, e);
-            ++dequeued_st_;
+            e.seq = increment_local(counters().entries);
+            write_to(current_sinks(), e);
+            increment_local(counters().returns);
             if (should_flush(lv)) flush_sinks();
             return;
         }
-        e.seq = seq_.fetch_add(1, std::memory_order_relaxed);
+        e.seq = active.sequence;
         if (queue_) {
             const int weight = level_weight(lv);
             detail::queued_event queued(std::move(e), (capture & sink::logger_name) != 0);
             bool accepted = queue_->try_push(std::move(queued), weight);
-            if (!accepted && (!cfg_.async.drop_when_full || lv >= level::warn))
+            if (!accepted && (!async_->config.drop_when_full || lv >= level::warn))
                 accepted = queue_->push_blocking(std::move(queued), weight);
-            if (!accepted) stats_.dropped.fetch_add(1, std::memory_order_relaxed);
+            if (!accepted) async_->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         auto current = current_sinks();
-        auto* pool = published_pool_.load(std::memory_order_acquire);
+        auto* pool = current_pool();
         if (pool && current && !current.empty()) {
             // Each event owns its strings once; all per-sink tasks share it.
             const bool flush_event = should_flush(lv);
@@ -1324,7 +1515,7 @@ private:
             }
         } else {
             if (current) write_to(current, e);
-            stats_.dequeued.fetch_add(1, std::memory_order_release);
+            if (parallel_) parallel_->dequeued.fetch_add(1, std::memory_order_release);
             if (should_flush(lv)) flush_sinks();
         }
     }
@@ -1336,19 +1527,22 @@ private:
     };
     void finish_parallel(parallel_event& job) noexcept {
         if (job.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            if (job.flush_event) stats_.flushed.fetch_add(1, std::memory_order_relaxed);
-            stats_.dequeued.fetch_add(1, std::memory_order_release);
+            if (job.flush_event) flushed_.fetch_add(1, std::memory_order_relaxed);
+            parallel_->dequeued.fetch_add(1, std::memory_order_release);
         }
     }
-    void write_one(sink& output, const log_event& e) noexcept {
+    template <class Event>
+    void write_one(sink& output, const Event& e) noexcept {
         try {
             const auto threshold = output.level_threshold();
-            if (threshold != level::off && e.lvl >= threshold) output.log(e);
+            if (threshold != level::off && e.lvl >= threshold) {
+                if constexpr (std::is_same_v<Event, log_event_view>) output.log_view(e);
+                else output.log(e);
+            }
         } catch (...) { error(); }
     }
-    using sink_list = std::vector<std::shared_ptr<sink>>;
-    template <class Outputs>
-    void write_to(const Outputs& outputs, const log_event& e) noexcept {
+    template <class Outputs, class Event>
+    void write_to(const Outputs& outputs, const Event& e) noexcept {
         for (auto& output : outputs) write_one(*output, e);
     }
     void flush_one(sink& output) noexcept {
@@ -1356,12 +1550,12 @@ private:
     }
     void flush_sinks() noexcept {
         if (single_threaded_) {
-            for (auto& output : sinks_st_) flush_one(*output);
-            ++flushed_st_;
+            for (auto& output : current_sinks()) flush_one(*output);
+            increment_local(flushed_);
         } else {
             if (auto current = current_sinks())
                 for (auto& output : current) flush_one(*output);
-            stats_.flushed.fetch_add(1, std::memory_order_relaxed);
+            flushed_.fetch_add(1, std::memory_order_relaxed);
         }
     }
     static bool reached(std::size_t done, std::size_t target) noexcept {
@@ -1370,47 +1564,60 @@ private:
     std::chrono::steady_clock::time_point flush_deadline(std::chrono::steady_clock::time_point now) const noexcept {
         using clock_type = std::chrono::steady_clock;
         const auto maximum = (clock_type::duration::max)();
-        if (cfg_.async.flush_every >= std::chrono::duration_cast<std::chrono::milliseconds>(maximum))
+        if (async_->config.flush_every >= std::chrono::duration_cast<std::chrono::milliseconds>(maximum))
             return (clock_type::time_point::max)();
-        const auto delta = std::chrono::duration_cast<clock_type::duration>(cfg_.async.flush_every);
+        const auto delta = std::chrono::duration_cast<clock_type::duration>(async_->config.flush_every);
         if (now.time_since_epoch() > maximum - delta) return (clock_type::time_point::max)();
         return now + delta;
     }
     void worker_loop() {
         log_event e;
-        const bool periodic = cfg_.async.flush_every.count() > 0;
+        const bool periodic = async_->config.flush_every.count() > 0;
         auto next_flush = periodic ? flush_deadline(std::chrono::steady_clock::now())
                                    : std::chrono::steady_clock::time_point{};
         for (;;) {
-            const auto n = queue_->pop_batch(batch_, cfg_.async.batch_max);
+            const auto n = queue_->pop_batch(async_->batch, async_->config.batch_max);
             if (n) {
                 if (auto current = current_sinks()) {
-                    for (auto& queued : batch_) {
-                        e.ts = queued.ts;
-                        e.tid = queued.tid;
-                        e.lvl = queued.lvl;
-                        e.loc = queued.loc;
-                        e.seq = queued.seq;
-                        e.payload = std::move(queued.payload);
-                        if (queued.capture_name) {
-                            if (e.name.empty()) e.name = cfg_.name;
-                        } else e.name.clear();
-                        write_to(current, e);
-                        if (should_flush(e.lvl)) {
-                            for (auto& output : current) flush_one(*output);
-                            stats_.flushed.fetch_add(1, std::memory_order_relaxed);
+                    if (views_only_.load(std::memory_order_acquire)) {
+                        for (const auto& queued : async_->batch) {
+                            const log_event_view view{queued.ts, queued.lvl, queued.tid,
+                                queued.capture_name ? std::string_view(name_) : std::string_view{},
+                                queued.payload, queued.seq, queued.loc};
+                            write_to(current, view);
+                            if (should_flush(view.lvl)) {
+                                for (auto& output : current) flush_one(*output);
+                                flushed_.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    } else {
+                        for (auto& queued : async_->batch) {
+                            e.ts = queued.ts;
+                            e.tid = queued.tid;
+                            e.lvl = queued.lvl;
+                            e.loc = queued.loc;
+                            e.seq = queued.seq;
+                            e.payload = std::move(queued.payload);
+                            if (queued.capture_name) {
+                                if (e.name.empty()) e.name = name_;
+                            } else e.name.clear();
+                            write_to(current, e);
+                            if (should_flush(e.lvl)) {
+                                for (auto& output : current) flush_one(*output);
+                                flushed_.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
                     }
                 }
-                batch_.clear(); // Release payloads before sleeping; reuse only the vector storage.
+                async_->batch.clear(); // Release payloads before sleeping; reuse only the vector storage.
                 std::string{}.swap(e.payload);
-                stats_.dequeued.fetch_add(n, std::memory_order_release);
+                async_->dequeued.fetch_add(n, std::memory_order_release);
                 const auto heads = queue_->heads();
-                completed_hi_.store(heads.hi, std::memory_order_release);
-                completed_lo_.store(heads.lo, std::memory_order_release);
-                progress_.fetch_add(1, std::memory_order_release);
-                progress_.notify_all();
-            } else if (worker_stop_.load(std::memory_order_acquire)) {
+                async_->completed_hi.store(heads.hi, std::memory_order_release);
+                async_->completed_lo.store(heads.lo, std::memory_order_release);
+                async_->progress.fetch_add(1, std::memory_order_release);
+                async_->progress.notify_all();
+            } else if (async_->stop.load(std::memory_order_acquire)) {
                 // Shutdown sets this only after every in-flight producer has left.
                 if (queue_->size_relaxed() == 0) break;
             }
@@ -1431,34 +1638,61 @@ private:
         }
     }
 
-    logger_config cfg_;
-    const bool single_threaded_;
-    std::atomic<level> level_, flush_level_;
-    std::atomic<unsigned> capture_mask_{0};
-    unsigned capture_mask_st_ = 0;
-    unsigned required_metadata_ = 0;
-    std::vector<std::unique_ptr<sink_node>> sink_nodes_;
-    sink_node* sinks_head_ = nullptr;
+    // Async buffers and parallel scheduling exist only in the modes using them.
+    struct async_state {
+        explicit async_state(logger_config::async_cfg settings) : config(settings),
+            queue(std::make_unique<dual_queue<detail::queued_event>>(settings.queue_capacity, settings.weighted_queue)) {
+            config.batch_max = std::clamp<std::size_t>(config.batch_max, 1, queue->capacity());
+            batch.reserve(config.batch_max);
+        }
+        logger_config::async_cfg config;
+        std::unique_ptr<dual_queue<detail::queued_event>> queue;
+        alignas(64) std::vector<detail::queued_event> batch;
+        std::thread worker;
+        std::atomic<bool> stop{false};
+        std::atomic<std::size_t> completed_hi{0}, completed_lo{0}, progress{0}, dequeued{0};
+        alignas(64) std::atomic<std::size_t> dropped{0};
+        // Producer admission must not invalidate the consumer's dispatch state.
+        alignas(64) log_counters counters;
+    };
+    struct parallel_state {
+        parallel_state(std::size_t threads, std::size_t pending) : pool_size(threads), capacity(pending) {}
+        const std::size_t pool_size, capacity;
+        std::unique_ptr<thread_pool> pool;
+        std::atomic<thread_pool*> published{nullptr};
+        std::atomic<std::size_t> dequeued{0};
+    };
+    log_counters& counters() const noexcept {
+        return async_ ? async_->counters : inline_counters_;
+    }
+    thread_pool* current_pool() const noexcept {
+        return parallel_ ? parallel_->published.load(std::memory_order_acquire) : nullptr;
+    }
+    // Single-thread mode uses plain loads/stores, sharing storage with MT counters.
+    static std::uint64_t increment_local(std::atomic<std::uint64_t>& value) noexcept {
+        const auto old = value.load(std::memory_order_relaxed);
+        value.store(old + 1, std::memory_order_relaxed);
+        return old;
+    }
+
+    std::string name_, pattern_;
+    sink_node first_sink_{nullptr, 1};
     std::atomic<sink_node*> sinks_tail_{nullptr};
-    std::mutex sinks_mu_;
-    sink_list sinks_st_;
-    // Read-mostly dispatch state must not share a cache line with producer
-    // counters or the worker's mutating batch vector.
-    std::unique_ptr<dual_queue<detail::queued_event>> queue_;
-    alignas(64) std::atomic<std::uint64_t> calls_{0};
-    std::atomic<std::uint64_t> seq_{0};
-    alignas(64) std::vector<detail::queued_event> batch_;
-    std::thread worker_;
-    std::atomic<bool> worker_stop_{false};
-    std::atomic<std::size_t> completed_hi_{0}, completed_lo_{0}, progress_{0};
-    std::mutex shutdown_mu_;
+    dual_queue<detail::queued_event>* queue_ = nullptr;
+    std::unique_ptr<async_state> async_;
+    std::unique_ptr<parallel_state> parallel_;
+    std::atomic<std::uint64_t> calls_{0};
+    mutable log_counters inline_counters_;
+    std::atomic<std::uint64_t> flushed_{0}, errors_{0};
+    std::atomic<level> level_, flush_level_;
+    std::atomic<unsigned char> capture_mask_{0};
+    const unsigned char allowed_metadata_;
+    unsigned char required_metadata_ = 0;
+    const bool single_threaded_;
+    std::atomic<bool> views_only_{true};
+    detail::compact_mutex sinks_mu_, shutdown_mu_;
     bool shutdown_done_ = false;
-    metrics stats_;
-    std::unique_ptr<thread_pool> pool_;
-    std::atomic<thread_pool*> published_pool_{nullptr};
-    std::uint64_t seq_st_ = 0;
-    std::size_t dropped_st_ = 0, dequeued_st_ = 0, flushed_st_ = 0, errors_st_ = 0;
-    bool stopped_st_ = false;
+
 };
 
 // Convenience macros for capturing source_location without changing call-sites.

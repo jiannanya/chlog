@@ -7,8 +7,12 @@ import re
 import subprocess
 import sys
 import ctypes
+import json
+import hashlib
+import statistics
+from datetime import datetime
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -52,9 +56,9 @@ def find_exe(build_dir: Path, name: str) -> Optional[Path]:
     return None
 
 
-def run_exe(exe: Path, env: Dict[str, str]) -> List[Result]:
+def run_exe(exe: Path, env: Dict[str, str], spdlog_first: bool = False):
     p = subprocess.run(
-        [str(exe)],
+        [str(exe)] + (["--spdlog-first"] if spdlog_first else []),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -66,7 +70,10 @@ def run_exe(exe: Path, env: Dict[str, str]) -> List[Result]:
         raise RuntimeError(f"Benchmark exited with {p.returncode}:\n{p.stdout}")
 
     results: List[Result] = []
+    metadata = {}
     for raw in p.stdout.splitlines():
+        if raw.startswith("META "):
+            metadata.update(parse_kv(raw[5:]))
         m = RESULT_RE.match(raw.strip())
         if not m:
             continue
@@ -86,7 +93,11 @@ def run_exe(exe: Path, env: Dict[str, str]) -> List[Result]:
     if not results:
         raise RuntimeError(f"No RESULT lines parsed from {exe}. Output:\n{p.stdout}")
 
-    return results
+    for r in results:
+        expected = 0 if r.case == "filtered_out" else r.calls
+        if r.processed != expected or r.dropped != 0:
+            raise RuntimeError(f"Incomplete benchmark: {r}")
+    return results, metadata, p.stdout
 
 
 def fmt_num(x: Optional[float]) -> str:
@@ -199,9 +210,18 @@ def main() -> int:
     ap.add_argument("--build-dir", default="build-clang", help="CMake build directory containing executables")
     ap.add_argument("--out", default="docs/logbench_results.md", help="Markdown output path")
     ap.add_argument("--iters", type=int, default=1_000_000, help="Iterations (CHLOG_BENCH_ITERS)")
+    ap.add_argument("--repeats", type=int, default=5, help="Runs to aggregate by median; alternate library order")
+    ap.add_argument("--affinity", type=lambda s: int(s, 0), help="Optional Windows CPU mask, e.g. 0x5555")
     args = ap.parse_args()
     if args.iters <= 0:
         ap.error("--iters must be positive")
+    if args.repeats <= 0:
+        ap.error("--repeats must be positive")
+    if args.affinity is not None:
+        if os.name != "nt" or args.affinity <= 0:
+            ap.error("--affinity requires Windows and a positive CPU mask")
+        if not ctypes.windll.kernel32.SetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.c_size_t(args.affinity)):
+            raise ctypes.WinError()
 
     root = Path(__file__).resolve().parent.parent
     build_dir = (root / args.build_dir).resolve()
@@ -213,7 +233,28 @@ def main() -> int:
     env = dict(os.environ)
     env["CHLOG_BENCH_ITERS"] = str(args.iters)
 
-    results = run_exe(exe, env)
+    samples = {}
+    runs = []
+    metadata = None
+    expected_cases = None
+    for index in range(args.repeats):
+        results, run_metadata, stdout = run_exe(exe, env, index % 2 == 1)
+        keys = {(r.case, r.runner) for r in results}
+        if expected_cases is not None and keys != expected_cases:
+            raise RuntimeError("Benchmark cases changed between runs")
+        if metadata is not None and metadata != run_metadata:
+            raise RuntimeError("Benchmark configuration changed between runs")
+        expected_cases, metadata = keys, run_metadata
+        for r in results:
+            samples.setdefault((r.case, r.runner), []).append(r)
+        runs.append({"run": index + 1, "first": "spdlog" if index % 2 else "chlog",
+                     "results": [asdict(r) for r in results], "stdout": stdout})
+        print(f"Completed run {index + 1}/{args.repeats}", flush=True)
+    results = [Result(runner=runner, case=case, calls=group[0].calls,
+                      seconds=statistics.median(r.seconds for r in group),
+                      cps=statistics.median(r.cps for r in group),
+                      processed=group[0].processed, dropped=0)
+               for (case, runner), group in samples.items()]
 
     # index by case -> runner
     by_case: Dict[str, Dict[str, Result]] = {}
@@ -230,8 +271,29 @@ def main() -> int:
     cpu_count = os.cpu_count()
     mem_total = windows_total_phys_mem_bytes() if os.name == "nt" else None
 
-    versions = vcpkg_versions(["spdlog", "fmt"])
+    versions = {name: metadata[name] for name in ("spdlog", "fmt") if name in metadata}
     chlog_ver = read_chlog_version(root)
+    if chlog_ver:
+        versions["chlog"] = chlog_ver
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    build_flags = ""
+    cache = build_dir / "CMakeCache.txt"
+    if cache.exists():
+        match = re.search(r"^CMAKE_CXX_FLAGS_RELEASE:STRING=(.*)$", cache.read_text(encoding="utf8"), re.MULTILINE)
+        if match:
+            build_flags = match.group(1).strip()
+
+    raw_path = out_path.with_suffix(".json")
+    raw_path.write_text(json.dumps({
+        "schema": "chlog-vs-spdlog/v1", "date": timestamp[:10], "timestamp": timestamp,
+        "iterations": args.iters, "repeats": args.repeats, "host": host, "cpu": cpu,
+        "logical_cpus": cpu_count, "memory_bytes": mem_total, "versions": versions,
+        "metadata": metadata, "build_flags": build_flags,
+        "affinity_mask": hex(args.affinity) if args.affinity is not None else None,
+        "source_sha256": {str(p.relative_to(root)).replace("\\", "/"): hashlib.sha256(p.read_bytes()).hexdigest()
+                          for p in (root / "include/chlog/chlog.hpp", root / "benchmarks/loggers_bench.cpp")},
+        "medians": [asdict(r) for r in results], "runs": runs,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf8")
 
     runners = sorted({r.runner for r in results})
 
@@ -241,6 +303,11 @@ def main() -> int:
         f.write(f"- Host: `{host}`\n")
         f.write(f"- Python: `{py}`\n")
         f.write(f"- Iterations: `{args.iters}`\n\n")
+        f.write(f"- Measured: `{timestamp}`\n")
+        f.write(f"- Runs: `{args.repeats}`; medians; library order alternates\n")
+        f.write(f"- Compiler: `{metadata.get('compiler', 'unavailable')}`; Release flags: `{build_flags}`\n")
+        f.write(f"- CPU affinity: `{hex(args.affinity) if args.affinity is not None else 'OS default'}`\n")
+        f.write(f"- Raw measurements: [{raw_path.name}]({raw_path.name})\n\n")
 
         f.write("## System\n\n")
         if cpu:
@@ -256,10 +323,26 @@ def main() -> int:
             f.write(f"- chlog: `{chlog_ver}`\n")
         for k in ["spdlog", "fmt"]:
             if k in versions:
-                f.write(f"- {k}: `{versions[k]}` (vcpkg)\n")
+                f.write(f"- {k}: `{versions[k]}` (reported by the benchmark executable)\n")
         if not chlog_ver and not versions:
             f.write("- (unavailable)\n")
         f.write("\n")
+
+        f.write("## Workload\n\n")
+        f.write("Both libraries use the same fmt backend and a sink that performs one relaxed atomic increment per event. "
+                "There is no sink-level formatting, extra sink mutex, console output, or disk I/O. "
+                "Formatted cases log `v {}` with an integer; literal cases log `message ready`. "
+                "Cases ending in `_payload128` or `_payload1024` format a prebuilt string of that byte length with `{}`. "
+                "chlog uses `view_sink`; spdlog's sink receives its native borrowed log message. "
+                "Existing chlog sinks using owning `log_event` remain supported and may require string copies.\n\n")
+        f.write("Async cases use one worker, a 65,536-slot FIFO queue, blocking overflow, and include final draining "
+                "and worker shutdown. chlog uses `weighted_queue=false`. All recorded calls are verified as processed "
+                "with zero drops; filtered calls correctly process zero events.\n\n")
+        f.write("The sync_st and sync_mt cases each have one producer; chlog selects its corresponding logger mode. "
+                "The spdlog logger and atomic counter sink are the same in both. Library metadata policies remain native: "
+                "chlog's `{msg}` mode omits unused fields, while spdlog still captures its normal event metadata. "
+                "These are logging API and dispatch measurements, not end-to-end file throughput. "
+                "Filter-only runs are very short and sensitive to timing noise.\n\n")
 
         f.write("## Summary (calls/s, higher is better)\n\n")
         f.write("| Case | " + " | ".join(runners) + " |\n")

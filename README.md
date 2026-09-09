@@ -28,8 +28,7 @@
 - [chlog](#chlog)
   - [Highlights](#highlights)
   - [Contents](#contents)
-  - [Optimization and validation](#optimization-and-validation)
-  - [Historical results](#historical-results)
+  - [Benchmark results](#benchmark-results)
   - [Quick Start](#quick-start)
   - [Feature spotlight: message-only mode](#feature-spotlight-message-only-mode)
     - [Example: high-throughput message-only async file logger](#example-high-throughput-message-only-async-file-logger)
@@ -47,25 +46,27 @@
     - [Generate Markdown report](#generate-markdown-report)
     - [Regenerate report + chart](#regenerate-report--chart)
 
-## Optimization and validation
+## Benchmark results
 
-The current implementation and before/after measurements are documented in
-[the second optimization report](docs/optimization_round2.md), with the earlier correctness
-and rendering changes in [the first report](docs/optimization_results.md). The chart below is a historical
-comparison with spdlog; it is not a measurement of the current revision.
+![chlog vs spdlog: logging throughput and filtered calls](docs/logbench_summary.svg)
 
-## Historical results
+Measured with chlog 1.0.0 and spdlog 1.15.3 using the same fmt 11.1.4 backend.
+Each case runs 2,000,000 calls, with nine-run medians and alternating library order.
+Bars start at zero; filtered calls use a separate scale. Higher throughput is better,
+and the ratio column shows chlog throughput divided by spdlog throughput.
 
-![chlog vs spdlog benchmark chart](docs/logbench_summary.svg)
+These results use atomic counter sinks and exclude disk I/O. Async cases use equal
+65,536-slot FIFO queues with blocking overflow and include draining the worker.
+Library metadata policies differ; see the [full methodology and results](docs/logbench_results.md)
+and [raw measurements](docs/logbench_results.json).
 
-| Case | chlog | spdlog |
-|---|---:|---:|
-| async_mt | 5.026e+06 | 4.130e+06 |
-| filtered_out | 4.510e+09 | 4.395e+08 |
-| sync_mt | 1.737e+07 | 1.695e+07 |
-| sync_st | 2.836e+07 | 2.288e+07 |
-
-Full details (including per-case tables, CPU/memory, and library versions) are in [docs/logbench_results.md](docs/logbench_results.md).
+The [memory comparison](docs/logbench_memory.md) covers 13 B, 128 B and 1 KiB
+messages, including a full queue. It reports process memory separately from C++
+allocation diagnostics, including 1,000 and 10,000 synchronous instances. With one
+view counter sink and `parallel_sinks = false`, a synchronous instance retains
+288 B for chlog and 352 B for spdlog; construction peaks are also 288 B and 352 B.
+These figures describe this benchmark configuration.
+Build, sanitizer and package checks are recorded in [validation results](docs/logbench_validation.md).
 
 ## Quick Start
 
@@ -185,8 +186,8 @@ Recommendation:
 ## Queue, lifecycle, and metrics
 
 - `async.queue_capacity` is the actual number of event slots, with a minimum of 4 in
-  weighted mode or 2 in FIFO mode. Capacities are no longer rounded up independently
-  for each priority tier. `queue_capacity()` reports the effective value.
+  weighted mode or 2 in FIFO mode. The two priority tiers share the configured total
+  capacity. `queue_capacity()` reports the effective value.
 - `weighted_queue = true` reserves approximately one quarter of the slots for `warn+`
   (at least two). Both tiers receive service; ordering is preserved within each tier.
   Set `weighted_queue = false` for a single FIFO queue.
@@ -212,7 +213,8 @@ Recommendation:
   format string. Allocation failure is not guaranteed to be recoverable.
 
 Built-in sink level changes and pattern rendering are safe alongside logging.
-`set_pattern()` publishes an immutable compiled pattern per sink; queued records use
+`set_pattern()` publishes a complete pattern per sink; `{msg}` and `{json}` have
+dedicated paths, while other patterns use immutable compiled snapshots. Queued records use
 the pattern current when rendered. Call `flush()` first when a clean pattern boundary
 is needed. Configure `set_thread_safe()` before sharing a sink with logging threads.
 Custom sinks reading the protected `pattern_` directly must synchronize those reads;
@@ -241,6 +243,28 @@ if (lg->should_log(chlog::level::debug)) {
     lg->debug("expensive value: {}", calculate_value());
 }
 ```
+
+### Custom sinks with event views
+
+Derive from `chlog::view_sink` to inspect records without an owning string copy:
+
+```cpp
+class counting_sink : public chlog::view_sink {
+public:
+    std::atomic<std::size_t> count{0};
+    void consume(const chlog::log_event_view&) override {
+        count.fetch_add(1, std::memory_order_relaxed);
+        // A view's payload and name are valid only during this callback.
+    }
+};
+```
+
+Use `event.own()` to retain an independent `log_event`. Views work with synchronous,
+asynchronous and parallel dispatch. With `parallel_sinks = false`, synchronous
+dispatch can format directly into temporary storage when every sink uses views.
+Async records continue to own their queued payloads. Existing `sink::log(log_event)`
+implementations and subclasses of built-in sinks keep their original callback path.
+The comparison counter sink uses event views, as does spdlog's native sink interface.
 
 ### Pattern
 
@@ -322,13 +346,17 @@ Benchmark executable:
 
 - `chlog_bench_loggers`
 - `chlog_render_bench` (render time, allocations, queue construction, logger-name allocations, sink registration)
+- `chlog_bench_memory` (Windows process memory, original CRT allocator)
+- `chlog_bench_allocations` (separate C++ new diagnostics; excludes malloc)
 
-Async benchmarks use a fixed 65,536-slot queue and blocking overflow instead of
-allocating a queue proportional to the iteration count. `async_4p` uses four producer
+Async benchmarks use a fixed 65,536-slot FIFO queue and blocking overflow;
+chlog sets `weighted_queue = false`. `async_4p` uses four producer
 threads; `async_mt` uses one producer with a thread-safe logger. The executable exits
 with an error if the expected processed count is not reached. Cases ending in `_literal`
 measure plain messages without arguments. Renderer allocation
 measurements count requested heap bytes, not process RSS.
+Cases ending in `_payload128` and `_payload1024` format prebuilt strings of those
+byte lengths. Both libraries receive the same message content.
 
 ### Dependencies (via vcpkg)
 
@@ -370,13 +398,14 @@ The program prints machine-parsable lines:
 ### Generate Markdown report
 
 ```powershell
-python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 1000000
+python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 2000000 --repeats 5
 ```
 
 The report includes:
 
 - CPU + total memory info
-- vcpkg versions for `spdlog` (and `fmt` if present)
+- spdlog and fmt versions reported by the benchmark executable
+- per-case medians and all individual runs in a matching JSON file
 
 Note:
 
@@ -384,7 +413,26 @@ Note:
 
 ### Regenerate report + chart
 
+Generate the comparison chart from saved measurements:
+
 ```powershell
-python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 2000000
-python ./tools/logbench_plot.py --in docs/logbench_results.md --out docs/logbench_summary.svg
+python ./tools/logbench_plot.py --in docs/logbench_results.json --out docs/logbench_summary.svg
 ```
+
+Generate the Windows memory comparison in fresh processes:
+
+```powershell
+python ./tools/logbench_memory.py --build-dir build-ninja-clang --out docs/logbench_memory.md --repeats 5
+python ./tools/logbench_plot.py --in docs/logbench_results.json --memory docs/logbench_memory.json --out docs/logbench_summary.svg
+```
+
+To run a fresh chlog vs spdlog comparison and regenerate the chart:
+
+```powershell
+python ./tools/logbench_report.py --build-dir build-ninja-clang --out docs/logbench_results.md --iters 2000000 --repeats 5
+python ./tools/logbench_plot.py --in docs/logbench_results.json --out docs/logbench_summary.svg
+```
+
+On Windows, `--affinity 0x5555` can pin benchmark processes to the CPU mask used for
+the published run. Omit it or choose a mask supported by your machine. The plot tool
+also accepts the Markdown report through `--in docs/logbench_results.md`.
