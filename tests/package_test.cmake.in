@@ -1,0 +1,15 @@
+set(prefix "@CMAKE_CURRENT_BINARY_DIR@/install")
+set(consumer "@CMAKE_CURRENT_BINARY_DIR@/consumer")
+function(run)
+  execute_process(COMMAND ${ARGV} RESULT_VARIABLE result OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Command failed (${result}): ${ARGV}\n${out}\n${err}")
+  endif()
+endfunction()
+run("@CMAKE_COMMAND@" --install "@CMAKE_BINARY_DIR@" --prefix "${prefix}" --config Release)
+run("@CMAKE_COMMAND@" -S "@CMAKE_CURRENT_SOURCE_DIR@/package" -B "${consumer}"
+    -G "@CMAKE_GENERATOR@" "-DCMAKE_CXX_COMPILER=@CMAKE_CXX_COMPILER@"
+    "-Dchlog_DIR=${prefix}/@CMAKE_INSTALL_LIBDIR@/cmake/chlog"
+    "-DCMAKE_PREFIX_PATH=@CMAKE_PREFIX_PATH@" "-DCMAKE_BUILD_TYPE=Release")
+run("@CMAKE_COMMAND@" --build "${consumer}" --config Release)
+run("@CMAKE_CTEST_COMMAND@" --test-dir "${consumer}" --build-config Release --output-on-failure)

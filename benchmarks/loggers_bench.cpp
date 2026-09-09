@@ -101,7 +101,11 @@ struct run_result {
   }
 };
 
+bool benchmark_failed = false;
+
 void print_result(const run_result& r) {
+  const auto expected = r.bench_case == "filtered_out" ? 0 : r.calls;
+  if (r.processed != expected || r.dropped != 0) benchmark_failed = true;
   std::cout << "RESULT"
             << " runner=" << r.runner
             << " case=" << r.bench_case
@@ -111,20 +115,6 @@ void print_result(const run_result& r) {
             << " processed=" << r.processed
             << " dropped=" << r.dropped
             << "\n";
-}
-
-std::uint64_t next_pow2_u64(std::uint64_t v) {
-  if (v <= 1) {
-    return 1;
-  }
-  --v;
-  v |= (v >> 1);
-  v |= (v >> 2);
-  v |= (v >> 4);
-  v |= (v >> 8);
-  v |= (v >> 16);
-  v |= (v >> 32);
-  return v + 1;
 }
 
 // -------------------- chlog sinks --------------------
@@ -143,6 +133,7 @@ private:
   std::atomic<std::uint64_t>* processed_;
 };
 
+template <bool Plain = false>
 run_result bench_chlog_sync(bool single_threaded, std::uint64_t iters) {
   std::atomic<std::uint64_t> processed{0};
 
@@ -159,13 +150,15 @@ run_result bench_chlog_sync(bool single_threaded, std::uint64_t iters) {
 
   const auto t0 = clock_t::now();
   for (std::uint64_t i = 0; i < iters; ++i) {
-    lg->info("v {}", i);
+    if constexpr (Plain) lg->info("message ready");
+    else lg->info("v {}", i);
   }
   const auto t1 = clock_t::now();
 
   run_result r;
   r.runner = "chlog";
   r.bench_case = single_threaded ? "sync_st" : "sync_mt";
+  if constexpr (Plain) r.bench_case += "_literal";
   r.calls = iters;
   r.seconds = std::chrono::duration<double>(t1 - t0).count();
   r.processed = processed.load(std::memory_order_relaxed);
@@ -207,7 +200,8 @@ run_result bench_chlog_filtered_out(std::uint64_t iters) {
   return r;
 }
 
-run_result bench_chlog_async_mt(std::uint64_t iters) {
+template <bool Plain = false>
+run_result bench_chlog_async_mt(std::uint64_t iters, unsigned producers = 1) {
   std::atomic<std::uint64_t> processed{0};
 
   chlog::logger_config cfg;
@@ -215,13 +209,8 @@ run_result bench_chlog_async_mt(std::uint64_t iters) {
   cfg.level = chlog::level::info;
   cfg.single_threaded = false;
   cfg.async.enabled = true;
-  {
-    auto cap = next_pow2_u64(iters);
-    if (cap > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
-      cap = static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
-    }
-    cfg.async.queue_capacity = static_cast<std::uint32_t>(cap);
-  }
+  cfg.async.queue_capacity = 65536;
+  cfg.async.drop_when_full = false;
   cfg.async.batch_max = 256;
   cfg.async.flush_every = std::chrono::milliseconds(0);
   cfg.parallel_sinks = false;
@@ -231,26 +220,31 @@ run_result bench_chlog_async_mt(std::uint64_t iters) {
   lg->add_sink(std::make_shared<chlog_counter_sink>(processed));
 
   const auto t0 = clock_t::now();
-  for (std::uint64_t i = 0; i < iters; ++i) {
-    lg->info("v {}", i);
+  auto produce = [&](unsigned thread) {
+    for (std::uint64_t i = thread; i < iters; i += producers) {
+      if constexpr (Plain) lg->info("message ready");
+      else lg->info("v {}", i);
+    }
+  };
+  if (producers == 1) produce(0);
+  else {
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < producers; ++t) threads.emplace_back(produce, t);
+    for (auto& t : threads) t.join();
   }
-
-  // Wait until the async worker has processed everything.
-  const auto deadline = t0 + std::chrono::seconds(30);
-  while (processed.load(std::memory_order_relaxed) < iters && clock_t::now() < deadline) {
-    std::this_thread::yield();
-  }
+  // Include draining, without a busy loop or an iteration-sized allocation.
+  lg->shutdown();
   const auto t1 = clock_t::now();
 
   run_result r;
   r.runner = "chlog";
-  r.bench_case = "async_mt";
+  r.bench_case = producers == 1 ? "async_mt" : "async_4p";
+  if constexpr (Plain) r.bench_case += "_literal";
   r.calls = iters;
   r.seconds = std::chrono::duration<double>(t1 - t0).count();
   r.processed = processed.load(std::memory_order_relaxed);
-  r.dropped = 0;
+  r.dropped = lg->stats().dropped;
 
-  lg->shutdown();
   return r;
 }
 
@@ -334,15 +328,8 @@ run_result bench_spdlog_filtered_out(std::uint64_t iters) {
 run_result bench_spdlog_async_mt(std::uint64_t iters) {
   std::atomic<std::uint64_t> processed{0};
 
-  // Create a dedicated thread pool for this benchmark.
-  // Queue size chosen to keep overhead modest; the counter sink is fast, so it typically doesn't overflow.
-  {
-    auto q = next_pow2_u64(iters);
-    if (q > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-      q = static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
-    }
-    spdlog::init_thread_pool(static_cast<std::size_t>(q), 1);
-  }
+  // Fixed capacity matches chlog and keeps memory independent of iterations.
+  spdlog::init_thread_pool(65536, 1);
 
   auto sink = std::make_shared<spdlog_counter_sink<std::mutex>>(processed);
 
@@ -388,6 +375,10 @@ int main(int argc, char** argv) {
   print_result(bench_chlog_sync(true, cfg.iters));
   print_result(bench_chlog_sync(false, cfg.iters));
   print_result(bench_chlog_async_mt(cfg.iters));
+  print_result(bench_chlog_async_mt(cfg.iters, 4));
+  print_result(bench_chlog_sync<true>(true, cfg.iters));
+  print_result(bench_chlog_sync<true>(false, cfg.iters));
+  print_result(bench_chlog_async_mt<true>(cfg.iters));
 
 #if defined(CHLOG_HAS_SPDLOG)
   // spdlog
@@ -399,5 +390,5 @@ int main(int argc, char** argv) {
   std::cerr << "NOTE: spdlog not available (build without CHLOG_HAS_SPDLOG).\n";
 #endif
 
-  return 0;
+  return benchmark_failed ? 1 : 0;
 }

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(chlog_package_consumer LANGUAGES CXX)
+find_package(chlog CONFIG REQUIRED)
+add_executable(chlog_package_consumer main.cpp)
+target_link_libraries(chlog_package_consumer PRIVATE chlog::chlog)
+enable_testing()
+add_test(NAME consumer COMMAND chlog_package_consumer)

@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     const double seconds = static_cast<double>(dur_ns) / 1e9;
 
     const auto s = lg->stats();
-    const double msgs_per_sec = seconds > 0.0 ? (static_cast<double>(s.dequeued) / seconds) : 0.0;
+    const double msgs_per_sec = seconds > 0.0 ? (static_cast<double>(iterations) / seconds) : 0.0;
 
     std::cout << "Iterations:  " << iterations << "\n";
     std::cout << "Seconds:     " << seconds << "\n";

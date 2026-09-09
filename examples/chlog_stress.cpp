@@ -70,5 +70,5 @@ int main() {
     std::cout << "Flushed:    " << s.flushed << "\n";
     std::cout << "Queue size: " << s.queue_size << "\n";
 
-    std::cout << "Throughput: " << (s.dequeued * 1000.0 / dur_ms) << " msgs/s\n";
+    std::cout << "Throughput: " << (dur_ms > 0 ? s.dequeued * 1000.0 / dur_ms : 0.0) << " msgs/s\n";
 }

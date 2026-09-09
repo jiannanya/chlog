@@ -4,6 +4,9 @@ project(chlog VERSION 1.0.0 LANGUAGES CXX)
 
 option(CHLOG_BUILD_EXAMPLES "Build chlog examples" ON)
 option(CHLOG_BUILD_BENCHMARKS "Build chlog benchmarks" ON)
+option(CHLOG_USE_FMT "Use fmt instead of std::format" OFF)
+include(CTest)
+option(CHLOG_BUILD_TESTS "Build chlog regression tests" ${BUILD_TESTING})
 
 include(GNUInstallDirs)
 
@@ -17,6 +20,13 @@ target_include_directories(chlog
 )
 
 target_compile_features(chlog INTERFACE cxx_std_20)
+find_package(Threads REQUIRED)
+target_link_libraries(chlog INTERFACE Threads::Threads)
+if (CHLOG_USE_FMT)
+  find_package(fmt CONFIG REQUIRED)
+  target_link_libraries(chlog INTERFACE fmt::fmt)
+  target_compile_definitions(chlog INTERFACE CHLOG_USE_FMT=1)
+endif()
 
 if (MSVC)
   target_compile_options(chlog INTERFACE /W4 /permissive-)
@@ -30,6 +40,11 @@ endif()
 
 if (CHLOG_BUILD_BENCHMARKS)
   include(${CMAKE_CURRENT_LIST_DIR}/benchmarks/CMakeLists.txt)
+endif()
+
+if (CHLOG_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()
 
 # --------------------------- Install / Package ---------------------------

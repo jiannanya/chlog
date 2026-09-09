@@ -1,0 +1,10 @@
+add_executable(chlog_tests chlog_tests.cpp)
+target_link_libraries(chlog_tests PRIVATE chlog::chlog)
+foreach(suite IN ITEMS formatting queue async parallel files concurrent configuration registration)
+  add_test(NAME chlog_${suite} COMMAND chlog_tests ${suite})
+  set_tests_properties(chlog_${suite} PROPERTIES TIMEOUT 60)
+endforeach()
+
+configure_file(package_test.cmake.in package_test.cmake @ONLY)
+add_test(NAME chlog_package COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/package_test.cmake)
+set_tests_properties(chlog_package PROPERTIES TIMEOUT 120)

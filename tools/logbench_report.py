@@ -60,7 +60,10 @@ def run_exe(exe: Path, env: Dict[str, str]) -> List[Result]:
         env=env,
         text=True,
         check=False,
+        timeout=180,
     )
+    if p.returncode:
+        raise RuntimeError(f"Benchmark exited with {p.returncode}:\n{p.stdout}")
 
     results: List[Result] = []
     for raw in p.stdout.splitlines():
@@ -197,6 +200,8 @@ def main() -> int:
     ap.add_argument("--out", default="docs/logbench_results.md", help="Markdown output path")
     ap.add_argument("--iters", type=int, default=1_000_000, help="Iterations (CHLOG_BENCH_ITERS)")
     args = ap.parse_args()
+    if args.iters <= 0:
+        ap.error("--iters must be positive")
 
     root = Path(__file__).resolve().parent.parent
     build_dir = (root / args.build_dir).resolve()
