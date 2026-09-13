@@ -1,6 +1,8 @@
 #include <chlog/chlog.hpp>
 #include <spdlog/async.h>
 #include <spdlog/sinks/sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/pattern_formatter.h>
 #include <spdlog/spdlog.h>
 
 #include <atomic>
@@ -141,21 +143,71 @@ result measure_objects(std::size_t count, counter& sink, const std::string& payl
     return measure([&] { for (auto& logger : loggers) logger->info("{}", payload); },
                    [&] { for (auto& logger : loggers) drain(*logger); }, sink, 1);
 }
+
+result measure_files(std::string_view runner, bool single_threaded, std::size_t count,
+                     counter& sink, const std::string& payload) {
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("chlog-memory-files-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    if (!std::filesystem::create_directory(directory)) throw std::runtime_error("benchmark directory exists");
+    std::size_t index = 0;
+    result out;
+    if (runner == "chlog") {
+        out = measure_objects<chlog::logger>(count, sink, payload, [&] {
+            chlog::logger_config cfg;
+            cfg.name = "memory"; cfg.pattern = "{msg}"; cfg.single_threaded = single_threaded;
+            cfg.parallel_sinks = false; cfg.flush_on_level = chlog::level::off;
+            auto logger = std::make_shared<chlog::logger>(cfg);
+            logger->add_sink(std::make_shared<chlog::rotating_file_sink>(
+                directory / (std::to_string(index++) + ".log"), 1u << 20, 1));
+            return logger;
+        }, [](chlog::logger& logger) {
+            logger.shutdown();
+            const auto stats = logger.stats();
+            if (stats.enqueued != 1 || stats.dequeued != 1 || stats.errors)
+                throw std::runtime_error("Incomplete file benchmark");
+        });
+    } else {
+        out = measure_objects<spdlog::logger>(count, sink, payload, [&] {
+            const auto path = (directory / (std::to_string(index++) + ".log")).string();
+            std::shared_ptr<spdlog::sinks::sink> output;
+            if (single_threaded) output = std::make_shared<spdlog::sinks::rotating_file_sink_st>(path, 1u << 20, 1);
+            else output = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(path, 1u << 20, 1);
+            output->set_formatter(std::make_unique<spdlog::pattern_formatter>("%v", spdlog::pattern_time_type::local, "\n"));
+            return std::make_shared<spdlog::logger>("memory", output);
+        }, [](spdlog::logger& logger) { logger.flush(); });
+    }
+    // Validation and cleanup follow the last memory snapshot. The logger vector
+    // has been destroyed, so this also checks implicit file close/draining.
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto path = directory / (std::to_string(i) + ".log");
+        {
+            std::ifstream input(path, std::ios::binary);
+            const std::string content(std::istreambuf_iterator<char>{input}, {});
+            if (!input || content != payload + '\n') throw std::runtime_error("Incorrect file benchmark output");
+        }
+        sink.processed.fetch_add(1, std::memory_order_relaxed);
+        std::filesystem::remove(path);
+    }
+    std::filesystem::remove(directory);
+    return out;
+}
 }
 int main(int argc, char** argv) {
     std::printf("SIZES chlog_logger=%zu chlog_sink=%zu chlog_config=%zu chlog_metrics=%zu spdlog_logger=%zu spdlog_sink=%zu\n",
         sizeof(chlog::logger), sizeof(chlog::sink), sizeof(chlog::logger_config), sizeof(chlog::metrics), sizeof(spdlog::logger), sizeof(spdlog::sinks::sink));
     if (argc != 4) {
         std::fprintf(stderr, "usage: chlog_bench_memory chlog|spdlog sync_st|sync_mt|async|backlog payload_bytes\n"
-                            "       chlog_bench_memory chlog|spdlog objects_st|objects_mt object_count\n");
+                            "       chlog_bench_memory chlog|spdlog objects_st|objects_mt object_count\n"
+                            "       chlog_bench_memory chlog|spdlog file_st|file_mt file_count (1..128)\n");
         return 2;
     }
     const std::string_view runner = argv[1], mode = argv[2];
+    const bool files = mode == "file_st" || mode == "file_mt";
     if ((runner != "chlog" && runner != "spdlog") ||
-        (mode != "sync_st" && mode != "sync_mt" && mode != "async" && mode != "backlog" && mode != "objects_st" && mode != "objects_mt")) return 2;
-    const bool multiple = mode == "objects_st" || mode == "objects_mt";
+        (mode != "sync_st" && mode != "sync_mt" && mode != "async" && mode != "backlog" && mode != "objects_st" && mode != "objects_mt" && !files)) return 2;
+    const bool multiple = files || mode == "objects_st" || mode == "objects_mt";
     const auto parameter = std::strtoull(argv[3], nullptr, 10);
-    if (parameter == 0 || parameter > 65536) return 2;
+    if (parameter == 0 || parameter > 65536 || (files && parameter > 128)) return 2;
     const std::size_t objects = multiple ? static_cast<std::size_t>(parameter) : 1;
     const auto bytes = multiple ? 13 : parameter;
     const bool async = mode == "async" || mode == "backlog";
@@ -167,7 +219,9 @@ int main(int argc, char** argv) {
     result out;
     // Input storage and harness synchronization objects precede tracking.
     allocation::enabled.store(true);
-    if (multiple && runner == "chlog") {
+    if (files) {
+        out = measure_files(runner, mode == "file_st", objects, sink, payload);
+    } else if (multiple && runner == "chlog") {
         out = measure_objects<chlog::logger>(objects, sink, payload, [&] {
             chlog::logger_config cfg;
             cfg.name = "memory"; cfg.pattern = "{msg}";

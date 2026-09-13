@@ -33,11 +33,16 @@ def main():
     runs, grouped, object_sizes = [], {}, None
     workloads = [(mode, (13, 128, 1024)) for mode in ("sync_st", "sync_mt", "async", "backlog")]
     workloads += [(mode, (1000, 10000)) for mode in ("objects_st", "objects_mt")]
+    workloads += [(mode, (32, 128)) for mode in ("file_st", "file_mt")]
     for repeat in range(args.repeats):
         libraries = ("chlog", "spdlog") if repeat % 2 == 0 else ("spdlog", "chlog")
         for mode, parameters in workloads:
             for size in parameters:
                 for kind, exe in executables.items():
+                    # CRT and library buffering use different allocators. Compare
+                    # file instances using process totals, including both.
+                    if mode.startswith("file_") and kind != "process":
+                        continue
                     for library in libraries:
                         command = [str(exe), library, mode, str(size)]
                         proc = subprocess.run(command, capture_output=True, text=True, timeout=60, check=True)
@@ -54,7 +59,7 @@ def main():
                             raise RuntimeError(f"Incomplete benchmark or retained measured C++ allocations: {fields}")
                         if kind == "process" and not numeric["peak_private_bytes"]:
                             raise RuntimeError("Process memory is unavailable")
-                        label = f"{mode}_{size}" if mode.startswith("objects_") else mode
+                        label = f"{mode}_{size}" if mode.startswith(("objects_", "file_")) else mode
                         row = {"run": repeat + 1, "kind": kind, "runner": library, "case": label, **numeric}
                         runs.append(row)
                         grouped.setdefault((kind, library, label, size), []).append(numeric)
@@ -78,7 +83,7 @@ def main():
     lines = ["# chlog vs spdlog memory report", "", f"Measured: {timestamp}; {args.repeats} runs per case.", "",
              f"Host: {data['host']}; CPU: {data['cpu']}.", "",
              "Each library, payload and case runs in a fresh process. Both use the same fmt backend, a borrowed-event "
-             "counter sink, and one consumer with a 65,536-slot FIFO queue and blocking overflow. Synchronous cases "
+             "counter sink, and one consumer with a 65,536-slot FIFO queue and blocking overflow. Counter-sink synchronous cases "
              "run 10,000 calls; async streaming also runs 10,000 calls. Backlog cases block the first sink callback, "
              "then fill all 65,536 queue slots before releasing the consumer. Every record must be processed.", "",
              "## Process memory", "",
@@ -107,6 +112,18 @@ def main():
             cn, sn = (indexed["cpp_new", runner, label, 13] for runner in ("chlog", "spdlog"))
             lines.append(f"| {mode} | {count:,} | {ch['peak_private_bytes'] / 2**20:.3f} | {sp['peak_private_bytes'] / 2**20:.3f} | "
                          f"{cn['resident_bytes']:,.0f} | {sn['resident_bytes']:,.0f} |")
+    lines += ["", "## File instances", "",
+              "Each logger owns a distinct built-in rotating-file sink with a message-only pattern. "
+              "All files are open simultaneously and each receives one 13 B record. Snapshots include live "
+              "file buffers before and after flushing. Both libraries use LF newlines, and every file is "
+              "checked after destruction. These process totals include C++ allocations and CRT malloc buffers.", "",
+              "| Mode | Instances | chlog peak private (MiB) | spdlog peak private (MiB) | chlog peak working set (MiB) | spdlog peak working set (MiB) |",
+              "|---|---:|---:|---:|---:|---:|"]
+    for mode in ("file_st", "file_mt"):
+        for count in (32, 128):
+            ch, sp = (indexed["process", runner, f"{mode}_{count}", 13] for runner in ("chlog", "spdlog"))
+            values = [ch["peak_private_bytes"], sp["peak_private_bytes"], ch["peak_working_set_bytes"], sp["peak_working_set_bytes"]]
+            lines.append(f"| {mode} | {count} | " + " | ".join(f"{v / 2**20:.3f}" for v in values) + " |")
     lines += ["", "## C++ new diagnostics", "",
               "A separate instrumented executable tracks requested C++ new bytes; it is not used for the process "
               "memory table above. It excludes malloc/free and fmt's dynamic memory buffers, so zero allocations "
@@ -128,7 +145,7 @@ def main():
               f"{object_sizes['chlog_logger']} B for chlog and {object_sizes['spdlog_logger']} B for spdlog.", "",
               "These measurements cover the stated configuration. Existing "
               "owning-event chlog sinks can allocate when copying long messages; view_sink avoids that copy "
-              "for inline dispatch. Disk I/O, arbitrary user sinks and every platform are outside this comparison.", "",
+              "for inline dispatch. Arbitrary user sinks and every platform are outside this comparison.", "",
               f"Raw runs and source hashes: [{out.with_suffix('.json').name}]({out.with_suffix('.json').name}).", ""]
     out.write_text("\n".join(lines), encoding="utf8")
     print(f"Wrote: {out}")

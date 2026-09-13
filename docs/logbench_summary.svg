@@ -4,7 +4,7 @@
 <style>text{font-family:Segoe UI,Arial,sans-serif;font-variant-numeric:tabular-nums} .code{font-family:Consolas,Menlo,monospace}</style>
 <rect width="1280" height="1433" fill="#f3f6f8"/>
 <text x="40.00" y="43.00" font-size="12" fill="#078575" font-weight="700" text-anchor="start" letter-spacing="1.8">CHLOG / BENCHMARK</text>
-<text x="1240.00" y="43.00" font-size="13" fill="#576c7b" font-weight="400" text-anchor="end" >2026-09-10  /  9-run medians</text>
+<text x="1240.00" y="43.00" font-size="13" fill="#576c7b" font-weight="400" text-anchor="end" >2026-09-13  /  9-run medians</text>
 <text x="40.00" y="96.00" font-size="38" fill="#142b3a" font-weight="700" text-anchor="start" >chlog vs spdlog</text>
 <text x="40.00" y="131.00" font-size="17" fill="#576c7b" font-weight="400" text-anchor="start" >Logging API throughput  ·  Higher is better</text>
 <rect x="40.00" y="158.00" width="16.00" height="12.00" rx="3" fill="#078575" />
@@ -19,118 +19,118 @@
 <line x1="326.0" y1="310" x2="326.0" y2="1242" stroke="#e6edf1"/>
 <text x="326.00" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >0</text>
 <line x1="407.6" y1="310" x2="407.6" y2="1242" stroke="#e6edf1"/>
-<text x="407.60" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >14</text>
+<text x="407.60" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >18</text>
 <line x1="489.2" y1="310" x2="489.2" y2="1242" stroke="#e6edf1"/>
-<text x="489.20" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >28</text>
+<text x="489.20" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >36</text>
 <line x1="570.8" y1="310" x2="570.8" y2="1242" stroke="#e6edf1"/>
-<text x="570.80" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >42</text>
+<text x="570.80" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >54</text>
 <line x1="652.4" y1="310" x2="652.4" y2="1242" stroke="#e6edf1"/>
-<text x="652.40" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >56</text>
+<text x="652.40" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >72</text>
 <line x1="734.0" y1="310" x2="734.0" y2="1242" stroke="#e6edf1"/>
-<text x="734.00" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >70</text>
+<text x="734.00" y="1267.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="middle" >90</text>
 <text x="64.00" y="342.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Single-thread format</text>
 <text x="64.00" y="362.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_st</text>
-<rect x="326.00" y="326.00" width="187.24" height="12.00" rx="3" fill="#078575" data-case="sync_st" data-runner="chlog" data-cps="32123800"/>
-<text x="521.24" y="337.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >32.124</text>
-<rect x="326.00" y="349.00" width="125.52" height="12.00" rx="3" fill="#647dce" data-case="sync_st" data-runner="spdlog" data-cps="21535300"/>
-<text x="459.52" y="360.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >21.535</text>
+<rect x="326.00" y="326.00" width="145.17" height="12.00" rx="3" fill="#078575" data-case="sync_st" data-runner="chlog" data-cps="32022300"/>
+<text x="479.17" y="337.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >32.022</text>
+<rect x="326.00" y="349.00" width="97.65" height="12.00" rx="3" fill="#647dce" data-case="sync_st" data-runner="spdlog" data-cps="21540500"/>
+<text x="431.65" y="360.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >21.541</text>
 <text x="866.00" y="352.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.49×</text>
 <text x="64.00" y="412.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Thread-safe sync format</text>
 <text x="64.00" y="432.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_mt</text>
-<rect x="326.00" y="396.00" width="149.90" height="12.00" rx="3" fill="#078575" data-case="sync_mt" data-runner="chlog" data-cps="25718200"/>
-<text x="483.90" y="407.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >25.718</text>
-<rect x="326.00" y="419.00" width="125.11" height="12.00" rx="3" fill="#647dce" data-case="sync_mt" data-runner="spdlog" data-cps="21464700"/>
-<text x="459.11" y="430.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >21.465</text>
-<text x="866.00" y="422.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.20×</text>
+<rect x="326.00" y="396.00" width="118.48" height="12.00" rx="3" fill="#078575" data-case="sync_mt" data-runner="chlog" data-cps="26134200"/>
+<text x="452.48" y="407.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >26.134</text>
+<rect x="326.00" y="419.00" width="97.25" height="12.00" rx="3" fill="#647dce" data-case="sync_mt" data-runner="spdlog" data-cps="21453000"/>
+<text x="431.25" y="430.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >21.453</text>
+<text x="866.00" y="422.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.22×</text>
 <text x="64.00" y="482.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Async / 1 producer</text>
 <text x="64.00" y="502.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">async_mt</text>
-<rect x="326.00" y="466.00" width="30.61" height="12.00" rx="3" fill="#078575" data-case="async_mt" data-runner="chlog" data-cps="5251850"/>
-<text x="364.61" y="477.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >5.252</text>
-<rect x="326.00" y="489.00" width="18.08" height="12.00" rx="3" fill="#647dce" data-case="async_mt" data-runner="spdlog" data-cps="3101240"/>
-<text x="352.08" y="500.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >3.101</text>
-<text x="866.00" y="492.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.69×</text>
+<rect x="326.00" y="466.00" width="25.35" height="12.00" rx="3" fill="#078575" data-case="async_mt" data-runner="chlog" data-cps="5592270"/>
+<text x="359.35" y="477.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >5.592</text>
+<rect x="326.00" y="489.00" width="15.17" height="12.00" rx="3" fill="#647dce" data-case="async_mt" data-runner="spdlog" data-cps="3346160"/>
+<text x="349.17" y="500.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >3.346</text>
+<text x="866.00" y="492.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.67×</text>
 <text x="64.00" y="552.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Async / 4 producers</text>
 <text x="64.00" y="572.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">async_4p</text>
-<rect x="326.00" y="536.00" width="47.24" height="12.00" rx="3" fill="#078575" data-case="async_4p" data-runner="chlog" data-cps="8104720"/>
-<text x="381.24" y="547.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >8.105</text>
-<rect x="326.00" y="559.00" width="10.86" height="12.00" rx="3" fill="#647dce" data-case="async_4p" data-runner="spdlog" data-cps="1863260"/>
-<text x="344.86" y="570.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >1.863</text>
-<text x="866.00" y="562.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >4.35×</text>
+<rect x="326.00" y="536.00" width="36.83" height="12.00" rx="3" fill="#078575" data-case="async_4p" data-runner="chlog" data-cps="8124990"/>
+<text x="370.83" y="547.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >8.125</text>
+<rect x="326.00" y="559.00" width="7.61" height="12.00" rx="3" fill="#647dce" data-case="async_4p" data-runner="spdlog" data-cps="1679540"/>
+<text x="341.61" y="570.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >1.680</text>
+<text x="866.00" y="562.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >4.84×</text>
 <text x="64.00" y="622.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Single-thread plain text</text>
 <text x="64.00" y="642.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_st_literal</text>
-<rect x="326.00" y="606.00" width="407.96" height="12.00" rx="3" fill="#078575" data-case="sync_st_literal" data-runner="chlog" data-cps="69993900"/>
-<text x="741.96" y="617.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >69.994</text>
-<rect x="326.00" y="629.00" width="208.74" height="12.00" rx="3" fill="#647dce" data-case="sync_st_literal" data-runner="spdlog" data-cps="35813300"/>
-<text x="542.74" y="640.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >35.813</text>
-<text x="866.00" y="632.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.95×</text>
+<rect x="326.00" y="606.00" width="321.88" height="12.00" rx="3" fill="#078575" data-case="sync_st_literal" data-runner="chlog" data-cps="71002600"/>
+<text x="655.88" y="617.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >71.003</text>
+<rect x="326.00" y="629.00" width="161.11" height="12.00" rx="3" fill="#647dce" data-case="sync_st_literal" data-runner="spdlog" data-cps="35538900"/>
+<text x="495.11" y="640.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >35.539</text>
+<text x="866.00" y="632.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >2.00×</text>
 <text x="64.00" y="692.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Thread-safe sync plain text</text>
 <text x="64.00" y="712.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_mt_literal</text>
-<rect x="326.00" y="676.00" width="278.61" height="12.00" rx="3" fill="#078575" data-case="sync_mt_literal" data-runner="chlog" data-cps="47800200"/>
-<text x="612.61" y="687.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >47.800</text>
-<rect x="326.00" y="699.00" width="207.19" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_literal" data-runner="spdlog" data-cps="35547300"/>
-<text x="541.19" y="710.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >35.547</text>
-<text x="866.00" y="702.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.34×</text>
+<rect x="326.00" y="676.00" width="221.67" height="12.00" rx="3" fill="#078575" data-case="sync_mt_literal" data-runner="chlog" data-cps="48898300"/>
+<text x="555.67" y="687.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >48.898</text>
+<rect x="326.00" y="699.00" width="162.60" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_literal" data-runner="spdlog" data-cps="35867800"/>
+<text x="496.60" y="710.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >35.868</text>
+<text x="866.00" y="702.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.36×</text>
 <text x="64.00" y="762.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Async plain text / 1 producer</text>
 <text x="64.00" y="782.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">async_mt_literal</text>
-<rect x="326.00" y="746.00" width="37.19" height="12.00" rx="3" fill="#078575" data-case="async_mt_literal" data-runner="chlog" data-cps="6380530"/>
-<text x="371.19" y="757.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >6.381</text>
-<rect x="326.00" y="769.00" width="31.72" height="12.00" rx="3" fill="#647dce" data-case="async_mt_literal" data-runner="spdlog" data-cps="5442950"/>
-<text x="365.72" y="780.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >5.443</text>
-<text x="866.00" y="772.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.17×</text>
+<rect x="326.00" y="746.00" width="28.31" height="12.00" rx="3" fill="#078575" data-case="async_mt_literal" data-runner="chlog" data-cps="6244240"/>
+<text x="362.31" y="757.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >6.244</text>
+<rect x="326.00" y="769.00" width="22.80" height="12.00" rx="3" fill="#647dce" data-case="async_mt_literal" data-runner="spdlog" data-cps="5029670"/>
+<text x="356.80" y="780.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >5.030</text>
+<text x="866.00" y="772.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.24×</text>
 <text x="64.00" y="832.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Single-thread / 128 B</text>
 <text x="64.00" y="852.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_st_payload128</text>
-<rect x="326.00" y="816.00" width="262.78" height="12.00" rx="3" fill="#078575" data-case="sync_st_payload128" data-runner="chlog" data-cps="45084500"/>
-<text x="596.78" y="827.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >45.084</text>
-<rect x="326.00" y="839.00" width="141.61" height="12.00" rx="3" fill="#647dce" data-case="sync_st_payload128" data-runner="spdlog" data-cps="24296600"/>
-<text x="475.61" y="850.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >24.297</text>
-<text x="866.00" y="842.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.86×</text>
+<rect x="326.00" y="816.00" width="399.51" height="12.00" rx="3" fill="#078575" data-case="sync_st_payload128" data-runner="chlog" data-cps="88128200"/>
+<text x="733.51" y="827.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >88.128</text>
+<rect x="326.00" y="839.00" width="112.81" height="12.00" rx="3" fill="#647dce" data-case="sync_st_payload128" data-runner="spdlog" data-cps="24884800"/>
+<text x="446.81" y="850.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >24.885</text>
+<text x="866.00" y="842.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >3.54×</text>
 <text x="64.00" y="902.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Thread-safe sync / 128 B</text>
 <text x="64.00" y="922.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_mt_payload128</text>
-<rect x="326.00" y="886.00" width="199.62" height="12.00" rx="3" fill="#078575" data-case="sync_mt_payload128" data-runner="chlog" data-cps="34248400"/>
-<text x="533.62" y="897.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >34.248</text>
-<rect x="326.00" y="909.00" width="141.79" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_payload128" data-runner="spdlog" data-cps="24326800"/>
-<text x="475.79" y="920.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >24.327</text>
-<text x="866.00" y="912.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.41×</text>
+<rect x="326.00" y="886.00" width="251.61" height="12.00" rx="3" fill="#078575" data-case="sync_mt_payload128" data-runner="chlog" data-cps="55501400"/>
+<text x="585.61" y="897.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >55.501</text>
+<rect x="326.00" y="909.00" width="112.48" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_payload128" data-runner="spdlog" data-cps="24811900"/>
+<text x="446.48" y="920.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >24.812</text>
+<text x="866.00" y="912.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >2.24×</text>
 <text x="64.00" y="972.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Async / 128 B</text>
 <text x="64.00" y="992.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">async_mt_payload128</text>
-<rect x="326.00" y="956.00" width="23.87" height="12.00" rx="3" fill="#078575" data-case="async_mt_payload128" data-runner="chlog" data-cps="4094710"/>
-<text x="357.87" y="967.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >4.095</text>
-<rect x="326.00" y="979.00" width="19.66" height="12.00" rx="3" fill="#647dce" data-case="async_mt_payload128" data-runner="spdlog" data-cps="3372620"/>
-<text x="353.66" y="990.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >3.373</text>
-<text x="866.00" y="982.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.21×</text>
+<rect x="326.00" y="956.00" width="18.67" height="12.00" rx="3" fill="#078575" data-case="async_mt_payload128" data-runner="chlog" data-cps="4118400"/>
+<text x="352.67" y="967.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >4.118</text>
+<rect x="326.00" y="979.00" width="11.86" height="12.00" rx="3" fill="#647dce" data-case="async_mt_payload128" data-runner="spdlog" data-cps="2616870"/>
+<text x="345.86" y="990.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >2.617</text>
+<text x="866.00" y="982.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.57×</text>
 <text x="64.00" y="1042.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Single-thread / 1 KiB</text>
 <text x="64.00" y="1062.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_st_payload1024</text>
-<rect x="326.00" y="1026.00" width="108.09" height="12.00" rx="3" fill="#078575" data-case="sync_st_payload1024" data-runner="chlog" data-cps="18544800"/>
-<text x="442.09" y="1037.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >18.545</text>
-<rect x="326.00" y="1049.00" width="76.94" height="12.00" rx="3" fill="#647dce" data-case="sync_st_payload1024" data-runner="spdlog" data-cps="13201300"/>
-<text x="410.94" y="1060.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >13.201</text>
-<text x="866.00" y="1052.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.40×</text>
+<rect x="326.00" y="1026.00" width="397.75" height="12.00" rx="3" fill="#078575" data-case="sync_st_payload1024" data-runner="chlog" data-cps="87738500"/>
+<text x="731.75" y="1037.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >87.739</text>
+<rect x="326.00" y="1049.00" width="60.98" height="12.00" rx="3" fill="#647dce" data-case="sync_st_payload1024" data-runner="spdlog" data-cps="13451000"/>
+<text x="394.98" y="1060.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >13.451</text>
+<text x="866.00" y="1052.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >6.52×</text>
 <text x="64.00" y="1112.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Thread-safe sync / 1 KiB</text>
 <text x="64.00" y="1132.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">sync_mt_payload1024</text>
-<rect x="326.00" y="1096.00" width="94.87" height="12.00" rx="3" fill="#078575" data-case="sync_mt_payload1024" data-runner="chlog" data-cps="16277000"/>
-<text x="428.87" y="1107.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >16.277</text>
-<rect x="326.00" y="1119.00" width="73.47" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_payload1024" data-runner="spdlog" data-cps="12604800"/>
-<text x="407.47" y="1130.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >12.605</text>
-<text x="866.00" y="1122.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.29×</text>
+<rect x="326.00" y="1096.00" width="248.08" height="12.00" rx="3" fill="#078575" data-case="sync_mt_payload1024" data-runner="chlog" data-cps="54724100"/>
+<text x="582.08" y="1107.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >54.724</text>
+<rect x="326.00" y="1119.00" width="60.59" height="12.00" rx="3" fill="#647dce" data-case="sync_mt_payload1024" data-runner="spdlog" data-cps="13365400"/>
+<text x="394.59" y="1130.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >13.365</text>
+<text x="866.00" y="1122.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >4.09×</text>
 <text x="64.00" y="1182.00" font-size="14" fill="#142b3a" font-weight="600" text-anchor="start" >Async / 1 KiB</text>
 <text x="64.00" y="1202.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" class="code">async_mt_payload1024</text>
-<rect x="326.00" y="1166.00" width="18.28" height="12.00" rx="3" fill="#078575" data-case="async_mt_payload1024" data-runner="chlog" data-cps="3136400"/>
-<text x="352.28" y="1177.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >3.136</text>
-<rect x="326.00" y="1189.00" width="13.78" height="12.00" rx="3" fill="#647dce" data-case="async_mt_payload1024" data-runner="spdlog" data-cps="2364820"/>
-<text x="347.78" y="1200.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >2.365</text>
-<text x="866.00" y="1192.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.33×</text>
+<rect x="326.00" y="1166.00" width="17.64" height="12.00" rx="3" fill="#078575" data-case="async_mt_payload1024" data-runner="chlog" data-cps="3891880"/>
+<text x="351.64" y="1177.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >3.892</text>
+<rect x="326.00" y="1189.00" width="10.08" height="12.00" rx="3" fill="#647dce" data-case="async_mt_payload1024" data-runner="spdlog" data-cps="2223780"/>
+<text x="344.08" y="1200.00" font-size="12" fill="#142b3a" font-weight="500" text-anchor="start" >2.224</text>
+<text x="866.00" y="1192.00" font-size="15" fill="#078575" font-weight="650" text-anchor="end" >1.75×</text>
 <text x="326.00" y="1287.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" >Zero-based bars; a ratio below 1 favors spdlog.</text>
 <rect x="922.00" y="202.00" width="318.00" height="222.00" rx="16" fill="#fff" stroke="#dfe7eb"/>
 <text x="944.00" y="240.00" font-size="21" fill="#142b3a" font-weight="650" text-anchor="start" >Filter-only calls</text>
 <text x="944.00" y="265.00" font-size="13" fill="#576c7b" font-weight="400" text-anchor="start" >Billion calls/s  ·  Separate scale</text>
 <text x="944.00" y="288.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >chlog</text>
-<text x="1216.00" y="288.00" font-size="13" fill="#142b3a" font-weight="600" text-anchor="end" >1.086 B</text>
+<text x="1216.00" y="288.00" font-size="13" fill="#142b3a" font-weight="600" text-anchor="end" >1.097 B</text>
 <rect x="944.00" y="296.00" width="272.00" height="12.00" rx="3" fill="#f0f4f6" />
-<rect x="944.00" y="296.00" width="147.75" height="12.00" rx="3" fill="#078575" data-case="filtered_out" data-runner="chlog" data-cps="1086430000"/>
+<rect x="944.00" y="296.00" width="149.24" height="12.00" rx="3" fill="#078575" data-case="filtered_out" data-runner="chlog" data-cps="1097330000"/>
 <text x="944.00" y="332.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >spdlog</text>
-<text x="1216.00" y="332.00" font-size="13" fill="#142b3a" font-weight="600" text-anchor="end" >0.474 B</text>
+<text x="1216.00" y="332.00" font-size="13" fill="#142b3a" font-weight="600" text-anchor="end" >0.486 B</text>
 <rect x="944.00" y="340.00" width="272.00" height="12.00" rx="3" fill="#f0f4f6" />
-<rect x="944.00" y="340.00" width="64.48" height="12.00" rx="3" fill="#647dce" data-case="filtered_out" data-runner="spdlog" data-cps="474102000"/>
+<rect x="944.00" y="340.00" width="66.09" height="12.00" rx="3" fill="#647dce" data-case="filtered_out" data-runner="spdlog" data-cps="485991000"/>
 <text x="944.00" y="378.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" >0</text>
 <text x="1216.00" y="378.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="end" >2 B</text>
 <text x="944.00" y="404.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >Short runtimes are sensitive to timing noise.</text>
@@ -152,20 +152,20 @@
 <text x="944.00" y="886.00" font-size="21" fill="#142b3a" font-weight="650" text-anchor="start" >Full-queue memory</text>
 <text x="944.00" y="910.00" font-size="13" fill="#576c7b" font-weight="400" text-anchor="start" >Peak private MiB  ·  Lower is better</text>
 <text x="944.00" y="940.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >13 B payload</text>
-<rect x="944.00" y="950.00" width="15.39" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="13" data-runner="chlog" data-bytes="7335936"/>
-<text x="965.39" y="961.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >7.00</text>
+<rect x="944.00" y="950.00" width="15.38" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="13" data-runner="chlog" data-bytes="7331840"/>
+<text x="965.38" y="961.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >6.99</text>
 <rect x="944.00" y="970.00" width="58.33" height="12.00" rx="3" fill="#647dce" data-memory="backlog" data-payload="13" data-runner="spdlog" data-bytes="27803648"/>
 <text x="1008.33" y="981.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >26.52</text>
 <text x="944.00" y="1016.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >128 B payload</text>
-<rect x="944.00" y="1026.00" width="38.23" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="128" data-runner="chlog" data-bytes="18223104"/>
-<text x="988.23" y="1037.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >17.38</text>
+<rect x="944.00" y="1026.00" width="38.22" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="128" data-runner="chlog" data-bytes="18214912"/>
+<text x="988.22" y="1037.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >17.37</text>
 <rect x="944.00" y="1046.00" width="58.33" height="12.00" rx="3" fill="#647dce" data-memory="backlog" data-payload="128" data-runner="spdlog" data-bytes="27799552"/>
 <text x="1008.33" y="1057.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >26.51</text>
 <text x="944.00" y="1092.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >1,024 B payload</text>
-<rect x="944.00" y="1102.00" width="172.43" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="1024" data-runner="chlog" data-bytes="82186240"/>
-<text x="1122.43" y="1113.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >78.38</text>
-<rect x="944.00" y="1122.00" width="206.69" height="12.00" rx="3" fill="#647dce" data-memory="backlog" data-payload="1024" data-runner="spdlog" data-bytes="98512896"/>
-<text x="1156.69" y="1133.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >93.95</text>
+<rect x="944.00" y="1102.00" width="172.48" height="12.00" rx="3" fill="#078575" data-memory="backlog" data-payload="1024" data-runner="chlog" data-bytes="82206720"/>
+<text x="1122.48" y="1113.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >78.40</text>
+<rect x="944.00" y="1122.00" width="206.68" height="12.00" rx="3" fill="#647dce" data-memory="backlog" data-payload="1024" data-runner="spdlog" data-bytes="98508800"/>
+<text x="1156.68" y="1133.00" font-size="11" fill="#142b3a" font-weight="400" text-anchor="start" >93.95</text>
 <text x="944.00" y="1167.00" font-size="12" fill="#576c7b" font-weight="400" text-anchor="start" >Original allocator; fresh process per sample.</text>
 <text x="944.00" y="1189.00" font-size="11" fill="#576c7b" font-weight="400" text-anchor="start" >Includes runtime, stacks and allocator overhead.</text>
 <text x="944.00" y="1220.00" font-size="12" fill="#142b3a" font-weight="600" text-anchor="start" >Sync instance / requested heap</text>

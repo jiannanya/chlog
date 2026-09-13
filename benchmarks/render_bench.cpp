@@ -55,6 +55,12 @@ void operator delete[](void* p, std::size_t, std::align_val_t a) noexcept { ::op
 class render_sink final : public chlog::sink {
 public:
     void log(const chlog::log_event& e) override { bytes += render(e).size(); }
+    void buffered(const chlog::log_event& e) {
+        chlog::detail::text_buffer buffer;
+        render_to(e, buffer);
+        buffer.push_back('\n');
+        bytes += buffer.size();
+    }
     std::size_t bytes = 0;
 };
 
@@ -86,6 +92,22 @@ int main(int argc, char** argv) {
         std::cout << "RENDER pattern=" << pattern << " iterations=" << iterations
                   << " seconds=" << std::chrono::duration<double>(end - start).count()
                   << " allocations=" << allocation_count.load() << " bytes=" << output.bytes << '\n';
+        for (auto payload : {128u, 1024u}) {
+            e.payload.assign(payload, 'x');
+            allocation_count = 0;
+            allocated_bytes = 0;
+            track_allocations = true;
+            const auto buffered_start = std::chrono::steady_clock::now();
+            for (std::uint64_t i = 0; i < iterations; ++i) { e.seq = i; output.buffered(e); }
+            const auto buffered_end = std::chrono::steady_clock::now();
+            track_allocations = false;
+            const auto expected = payload == 128 ? 0 : iterations;
+            if (allocation_count != expected) return 1;
+            std::cout << "BUFFER pattern=" << pattern << " payload=" << payload << " iterations=" << iterations
+                      << " seconds=" << std::chrono::duration<double>(buffered_end - buffered_start).count()
+                      << " allocations=" << allocation_count.load() << " allocated_bytes=" << allocated_bytes.load()
+                      << " bytes=" << output.bytes << '\n';
+        }
     }
     chlog::logger_config cfg;
     cfg.async.enabled = true;

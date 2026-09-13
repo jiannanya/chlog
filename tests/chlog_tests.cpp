@@ -31,8 +31,15 @@ struct recording_sink : chlog::sink {
     std::vector<std::string> lines;
     std::atomic<std::size_t> flushes{0};
     std::string format(const chlog::log_event& e) const { return render(e); }
+    std::string buffered(const chlog::log_event& e) const {
+        chlog::detail::text_buffer output;
+        render_to(e, output);
+        return std::string(output.data(), output.size());
+    }
+    void append(const chlog::log_event_view& e, std::string& output) const { render_to(e, output); }
     void log(const chlog::log_event& e) override {
-        auto line = render(e);
+        // Exercise both output APIs during concurrent pattern replacement.
+        auto line = e.seq & 1 ? buffered(e) : render(e);
         std::lock_guard<std::mutex> lock(mutex);
         events.push_back(e);
         lines.push_back(std::move(line));
@@ -44,6 +51,13 @@ struct counter_sink : chlog::sink {
     std::atomic<std::size_t> count{0}, flushes{0};
     void log(const chlog::log_event&) override { ++count; }
     void flush() override { ++flushes; }
+};
+
+template <class Base>
+struct legacy_builtin_sink : Base {
+    using Base::Base;
+    std::size_t owning_calls = 0;
+    void log(const chlog::log_event& e) override { ++owning_calls; Base::log(e); }
 };
 
 struct recording_view_sink : chlog::view_sink {
@@ -74,6 +88,60 @@ chlog::logger_config config() {
 }
 
 void formatting() {
+    {
+        std::ostringstream captured;
+        struct restore_stream {
+            std::streambuf* previous;
+            ~restore_stream() { std::cout.rdbuf(previous); }
+        } restore{std::cout.rdbuf(captured.rdbuf())};
+        for (bool threaded : {false, true}) for (bool color : {false, true}) {
+            chlog::console_sink console(color ? chlog::console_sink::style::color : chlog::console_sink::style::plain);
+            console.set_pattern("{msg}");
+            console.set_thread_safe(threaded);
+            chlog::log_event event;
+            event.lvl = chlog::level::info;
+            for (auto size : {0u, 128u, 511u, 512u, 1024u}) {
+                captured.str("");
+                event.payload.assign(size, 'x');
+                if (size) event.payload[size / 2] = '\0';
+                console.log(event);
+                console.flush();
+                CHECK(captured.str() == (color ? "\x1b[32m" : "") + event.payload + (color ? "\x1b[0m\n" : "\n"));
+            }
+        }
+    }
+    // Every byte value at each possible alignment, including short tails. The
+    // expected control escapes are the JSON specification's canonical forms.
+    const std::array<std::string_view, 32> controls = {
+        "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+        "\\b", "\\t", "\\n", "\\u000B", "\\f", "\\r", "\\u000E", "\\u000F",
+        "\\u0010", "\\u0011", "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+        "\\u0018", "\\u0019", "\\u001A", "\\u001B", "\\u001C", "\\u001D", "\\u001E", "\\u001F"};
+    for (std::size_t offset = 0; offset < 24; ++offset) for (unsigned byte = 0; byte < 256; ++byte) {
+        const std::string prefix(offset, 'a');
+        const std::string raw(1, static_cast<char>(byte));
+        const std::string escaped = byte < 32 ? std::string(controls[byte])
+                                  : byte == '"' ? "\\\"" : byte == '\\' ? "\\\\" : raw;
+        for (auto suffix : {"", "abcdefghijk"})
+            CHECK(chlog::json_escape(prefix + raw + suffix) == prefix + escaped + suffix);
+    }
+    recording_sink buffer_test;
+    chlog::log_event buffer_event;
+    buffer_event.name = "buffer";
+    buffer_event.lvl = chlog::level::warn;
+    for (auto size : {0u, 1u, 127u, 500u, 511u, 512u, 513u, 1024u, 65536u}) {
+        buffer_event.payload.assign(size, 'x');
+        if (size) buffer_event.payload[size / 2] = '\0';
+        for (auto pattern : {"{msg}", "{json}", "{date} {time}.{ms} [{name}] {msg} {msg} {unknown}"}) {
+            buffer_test.set_pattern(pattern);
+            const auto expected = buffer_test.format(buffer_event);
+            CHECK(buffer_test.buffered(buffer_event) == expected);
+            std::string appended = "prefix:";
+            buffer_test.append({buffer_event.ts, buffer_event.lvl, buffer_event.tid, buffer_event.name,
+                                buffer_event.payload, buffer_event.seq, buffer_event.loc}, appended);
+            CHECK(appended == "prefix:" + expected);
+        }
+    }
     for (int mode = 0; mode < 4; ++mode) {
         auto view_cfg = config();
         view_cfg.single_threaded = mode == 0;
@@ -168,6 +236,10 @@ void formatting() {
     CHECK(json.find("\\u0000\\u0001\\u001F\\b\\f\\n\\r\\t\\\\\\\"") != std::string::npos);
     CHECK(json.find('\n') == std::string::npos);
     e.ts = std::chrono::system_clock::time_point{} - 1ms;
+    renderer.set_pattern("[{date} {time}.{ms}]|{date} {time}.{ms}|{unknown}");
+    const auto calendar = chlog::make_timestamp(e.ts);
+    CHECK(renderer.format(e) == "[" + calendar + "]|" + calendar + "|{unknown}");
+    CHECK(renderer.buffered(e) == "[" + calendar + "]|" + calendar + "|{unknown}");
     CHECK(chlog::make_timestamp(e.ts).ends_with(".999"));
     CHECK(chlog::make_timestamp((std::chrono::system_clock::time_point::max)()).size() == 23);
     CHECK(chlog::make_timestamp((std::chrono::system_clock::time_point::min)()).size() == 23);
@@ -196,6 +268,27 @@ void formatting() {
     CHECK(custom_output->lines.at(6) == "{runtime}");
     CHECK(custom_output->lines.at(7) == "lone }");
     CHECK(custom.stats().errors == 1);
+    for (bool views : {false, true}) for (bool async : {false, true}) {
+        auto string_config = config(); string_config.async.enabled = async; string_config.async.drop_when_full = false;
+        chlog::logger strings(string_config);
+        auto owned = std::make_shared<recording_sink>();
+        auto viewed = std::make_shared<recording_view_sink>();
+        strings.add_sink(views ? std::static_pointer_cast<chlog::sink>(viewed)
+                               : std::static_pointer_cast<chlog::sink>(owned));
+        std::string argument = "preserved";
+        strings.info("{}", std::move(argument));
+        CHECK(argument == "preserved");
+        strings.info(std::string("{}"), std::string_view(argument));
+        strings.info("{:>9.3}", std::string("hello"));
+        strings.info("{{{}}}", std::string("world"));
+        strings.info("{}", std::string{});
+        strings.shutdown();
+        const auto& events = views ? viewed->events : owned->events;
+        CHECK(events.size() == 5);
+        CHECK(events[0].payload == "preserved" && events[1].payload == "preserved");
+        CHECK(events[2].payload == "      hel" && events[3].payload == "{world}");
+        CHECK(events[4].payload.empty() && strings.stats().errors == 0);
+    }
 }
 
 void queue_tests() {
@@ -405,6 +498,126 @@ void file_tests() {
     std::filesystem::create_directories(dir);
     struct cleanup { std::filesystem::path dir; ~cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); } } clean{dir};
     {
+        std::string expected;
+        const auto path = dir / "buffer-boundaries.log";
+        {
+            chlog::detail::file_writer output;
+            output.open(path);
+            for (auto count : {0u, 1u, 4094u, 1u, 1u, 4096u, 4097u, 0u, 131072u, 3u}) {
+                std::string bytes(count, '\0');
+                for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<char>(i % 251);
+                output.write(bytes.data(), bytes.size());
+                expected += bytes;
+            }
+            // Destruction must drain the last partial block.
+        }
+        CHECK(read_file(path) == expected);
+    }
+    {
+        auto verify_legacy = [&](auto output) {
+            CHECK(!output->uses_views());
+            chlog::log_event_view event;
+            event.ts = std::chrono::system_clock::now();
+            event.payload = "direct borrowed call";
+            output->log_view(event);
+            chlog::logger logger(config());
+            logger.add_sink(output);
+            logger.info("legacy callback");
+            logger.shutdown();
+            CHECK(output->owning_calls == 2);
+        };
+        verify_legacy(std::make_shared<legacy_builtin_sink<chlog::rotating_file_sink>>(dir / "derived.log", 4096, 1));
+        verify_legacy(std::make_shared<legacy_builtin_sink<chlog::daily_file_sink>>(dir / "derived-daily"));
+        verify_legacy(std::make_shared<legacy_builtin_sink<chlog::json_sink>>(dir / "derived-json.log"));
+        std::ostringstream captured;
+        struct restore_stream {
+            std::streambuf* previous;
+            ~restore_stream() { std::cout.rdbuf(previous); }
+        } restore{std::cout.rdbuf(captured.rdbuf())};
+        verify_legacy(std::make_shared<legacy_builtin_sink<chlog::console_sink>>());
+        CHECK(captured.str().find("legacy callback") != std::string::npos);
+    }
+    for (int mode = 0; mode < 4; ++mode) {
+        const auto path = dir / ("borrowed-" + std::to_string(mode) + ".log");
+        auto cfg = config(); cfg.single_threaded = mode == 0;
+        cfg.async.enabled = mode == 2; cfg.parallel_sinks = mode == 3;
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<chlog::rotating_file_sink>(path, 1u << 20, 1);
+#if defined(__cpp_rtti) || defined(_CPPRTTI)
+        CHECK(output->uses_views());
+#else
+        CHECK(!output->uses_views());
+#endif
+        logger.add_sink(output);
+        std::string message(8192, 'x'); message[91] = '\0';
+        const auto expected = message + '\n';
+        logger.info("{}", message);
+        message.assign("changed input");
+        logger.shutdown();
+        CHECK(logger.stats().dequeued == 1 && logger.stats().errors == 0);
+        CHECK(read_file(path) == expected);
+    }
+    {
+        chlog::daily_file_sink daily(dir / "day-switch");
+        daily.set_pattern("{msg}");
+        chlog::log_event e;
+        const auto first = std::chrono::system_clock::now();
+        e.ts = first; e.payload = "first"; daily.log(e);
+        e.ts = first + std::chrono::hours(48); e.payload = "second"; daily.log(e);
+        e.ts = first; e.payload = "third"; daily.log(e);
+        daily.flush();
+        CHECK(read_file(dir / "day-switch" / (chlog::date_string(first) + ".log")) == "first\nthird\n");
+        CHECK(read_file(dir / "day-switch" / (chlog::date_string(first + std::chrono::hours(48)) + ".log")) == "second\n");
+    }
+    {
+        const auto path = dir / std::filesystem::path(u8"\u4e2d\u6587\u65e5\u5fd7.log");
+        std::string expected = "existing\n";
+        { std::ofstream initial(path, std::ios::binary); initial << expected; }
+        chlog::rotating_file_sink output(path, 1u << 20, 1);
+        output.set_pattern("{msg}");
+        chlog::log_event event;
+        for (auto size : {511u, 512u, 1024u}) {
+            event.payload.assign(size, 'x');
+            event.payload[size / 2] = '\0';
+            output.log(event);
+            expected += event.payload + '\n';
+        }
+        output.flush();
+        CHECK(read_file(path) == expected); // Reading while the writer remains open.
+    }
+#ifndef _WIN32
+    if (std::filesystem::exists("/dev/full")) {
+        chlog::logger logger(config());
+        logger.add_sink(std::make_shared<chlog::json_sink>("/dev/full"));
+        logger.info("buffered write");
+        logger.flush();
+        CHECK(logger.stats().errors >= 1);
+        logger.info("failed file stays failed");
+        logger.shutdown();
+        CHECK(logger.stats().errors >= 3);
+    }
+#endif
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        logger.add_sink(std::make_shared<chlog::rotating_file_sink>(dir / "concurrent.log", 16u << 20, 1));
+        std::vector<std::thread> writers;
+        for (int t = 0; t < 4; ++t) writers.emplace_back([&, t] {
+            for (int i = 0; i < 100; ++i)
+                logger.info("{}:{}:{}", t, i, std::string(i % 2 ? 511 : 4096, static_cast<char>('a' + t)));
+        });
+        for (auto& writer : writers) writer.join();
+        logger.shutdown();
+        CHECK(logger.stats().errors == 0 && logger.stats().dequeued == 400);
+        std::istringstream contents(read_file(dir / "concurrent.log"));
+        std::set<std::string> lines;
+        for (std::string line; std::getline(contents, line);) CHECK(lines.insert(line).second);
+        CHECK(lines.size() == 400);
+        for (int t = 0; t < 4; ++t) for (int i = 0; i < 100; ++i)
+            CHECK(lines.contains(std::to_string(t) + ":" + std::to_string(i) + ":" +
+                                 std::string(i % 2 ? 511 : 4096, static_cast<char>('a' + t))));
+    }
+    {
         chlog::rotating_file_sink file(dir / "rotate.log", 8, 2);
         file.set_pattern("{msg}");
         chlog::log_event e;
@@ -453,6 +666,20 @@ void file_tests() {
 }
 
 void concurrent_tests() {
+    {
+        chlog::detail::compact_mutex lock;
+        std::uint64_t total = 0, checksum = 0;
+        std::vector<std::thread> writers;
+        for (int t = 0; t < 8; ++t) writers.emplace_back([&] {
+            for (int i = 0; i < 4000; ++i) {
+                std::lock_guard<chlog::detail::compact_mutex> guard(lock);
+                checksum += ++total;
+                if (i % 31 == 0) std::this_thread::yield();
+            }
+        });
+        for (auto& writer : writers) writer.join();
+        CHECK(total == 32000 && checksum == total * (total + 1) / 2);
+    }
     for (int mode = 0; mode < 3; ++mode) {
         for (int round = 0; round < 12; ++round) {
             auto cfg = config(); cfg.async.enabled = mode == 1; cfg.parallel_sinks = mode == 2;

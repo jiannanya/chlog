@@ -5,7 +5,7 @@
 - Python: `3.10.7`
 - Iterations: `2000000`
 
-- Measured: `2026-09-10T00:08:05+08:00`
+- Measured: `2026-09-13T21:29:55+08:00`
 - Runs: `9`; medians; library order alternates
 - Compiler: `clang-17.0.6`; Release flags: `-O3 -DNDEBUG`
 - CPU affinity: `0x5555`
@@ -35,20 +35,20 @@ The sync_st and sync_mt cases each have one producer; chlog selects its correspo
 
 | Case | chlog | spdlog |
 |---|---:|---:|
-| async_4p | 8.105e+06 | 1.863e+06 |
-| async_mt | 5.252e+06 | 3.101e+06 |
-| async_mt_literal | 6.381e+06 | 5.443e+06 |
-| async_mt_payload1024 | 3.136e+06 | 2.365e+06 |
-| async_mt_payload128 | 4.095e+06 | 3.373e+06 |
-| filtered_out | 1.086e+09 | 4.741e+08 |
-| sync_mt | 2.572e+07 | 2.146e+07 |
-| sync_mt_literal | 4.780e+07 | 3.555e+07 |
-| sync_mt_payload1024 | 1.628e+07 | 1.260e+07 |
-| sync_mt_payload128 | 3.425e+07 | 2.433e+07 |
-| sync_st | 3.212e+07 | 2.154e+07 |
-| sync_st_literal | 6.999e+07 | 3.581e+07 |
-| sync_st_payload1024 | 1.854e+07 | 1.320e+07 |
-| sync_st_payload128 | 4.508e+07 | 2.430e+07 |
+| async_4p | 8.125e+06 | 1.680e+06 |
+| async_mt | 5.592e+06 | 3.346e+06 |
+| async_mt_literal | 6.244e+06 | 5.030e+06 |
+| async_mt_payload1024 | 3.892e+06 | 2.224e+06 |
+| async_mt_payload128 | 4.118e+06 | 2.617e+06 |
+| filtered_out | 1.097e+09 | 4.860e+08 |
+| sync_mt | 2.613e+07 | 2.145e+07 |
+| sync_mt_literal | 4.890e+07 | 3.587e+07 |
+| sync_mt_payload1024 | 5.472e+07 | 1.337e+07 |
+| sync_mt_payload128 | 5.550e+07 | 2.481e+07 |
+| sync_st | 3.202e+07 | 2.154e+07 |
+| sync_st_literal | 7.100e+07 | 3.554e+07 |
+| sync_st_payload1024 | 8.774e+07 | 1.345e+07 |
+| sync_st_payload128 | 8.813e+07 | 2.488e+07 |
 
 ## Details
 
@@ -56,97 +56,97 @@ The sync_st and sync_mt cases each have one producer; chlog selects its correspo
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.246770 | 8.105e+06 | 2000000 | 0 |
-| spdlog | 2000000 | 1.073390 | 1.863e+06 | 2000000 | 0 |
+| chlog | 2000000 | 0.246154 | 8.125e+06 | 2000000 | 0 |
+| spdlog | 2000000 | 1.190800 | 1.680e+06 | 2000000 | 0 |
 
 ### async_mt
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.380818 | 5.252e+06 | 2000000 | 0 |
-| spdlog | 2000000 | 0.644903 | 3.101e+06 | 2000000 | 0 |
+| chlog | 2000000 | 0.357637 | 5.592e+06 | 2000000 | 0 |
+| spdlog | 2000000 | 0.597700 | 3.346e+06 | 2000000 | 0 |
 
 ### async_mt_literal
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.313454 | 6.381e+06 | 2000000 | 0 |
-| spdlog | 2000000 | 0.367448 | 5.443e+06 | 2000000 | 0 |
+| chlog | 2000000 | 0.320295 | 6.244e+06 | 2000000 | 0 |
+| spdlog | 2000000 | 0.397640 | 5.030e+06 | 2000000 | 0 |
 
 ### async_mt_payload1024
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.637673 | 3.136e+06 | 2000000 | 0 |
-| spdlog | 2000000 | 0.845729 | 2.365e+06 | 2000000 | 0 |
+| chlog | 2000000 | 0.513891 | 3.892e+06 | 2000000 | 0 |
+| spdlog | 2000000 | 0.899371 | 2.224e+06 | 2000000 | 0 |
 
 ### async_mt_payload128
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.488435 | 4.095e+06 | 2000000 | 0 |
-| spdlog | 2000000 | 0.593011 | 3.373e+06 | 2000000 | 0 |
+| chlog | 2000000 | 0.485626 | 4.118e+06 | 2000000 | 0 |
+| spdlog | 2000000 | 0.764273 | 2.617e+06 | 2000000 | 0 |
 
 ### filtered_out
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.001841 | 1.086e+09 | 0 | 0 |
-| spdlog | 2000000 | 0.004219 | 4.741e+08 | 0 | 0 |
+| chlog | 2000000 | 0.001823 | 1.097e+09 | 0 | 0 |
+| spdlog | 2000000 | 0.004115 | 4.860e+08 | 0 | 0 |
 
 ### sync_mt
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.077766 | 2.572e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.093176 | 2.146e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.076528 | 2.613e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.093227 | 2.145e+07 | 2000000 | 0 |
 
 ### sync_mt_literal
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.041841 | 4.780e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.056263 | 3.555e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.040901 | 4.890e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.055760 | 3.587e+07 | 2000000 | 0 |
 
 ### sync_mt_payload1024
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.122873 | 1.628e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.158669 | 1.260e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.036547 | 5.472e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.149640 | 1.337e+07 | 2000000 | 0 |
 
 ### sync_mt_payload128
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.058397 | 3.425e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.082214 | 2.433e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.036035 | 5.550e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.080607 | 2.481e+07 | 2000000 | 0 |
 
 ### sync_st
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.062259 | 3.212e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.092871 | 2.154e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.062456 | 3.202e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.092848 | 2.154e+07 | 2000000 | 0 |
 
 ### sync_st_literal
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.028574 | 6.999e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.055845 | 3.581e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.028168 | 7.100e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.056276 | 3.554e+07 | 2000000 | 0 |
 
 ### sync_st_payload1024
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.107847 | 1.854e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.151500 | 1.320e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.022795 | 8.774e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.148688 | 1.345e+07 | 2000000 | 0 |
 
 ### sync_st_payload128
 
 | Runner | calls | seconds | calls/s | processed | dropped |
 |---|---:|---:|---:|---:|---:|
-| chlog | 2000000 | 0.044361 | 4.508e+07 | 2000000 | 0 |
-| spdlog | 2000000 | 0.082316 | 2.430e+07 | 2000000 | 0 |
+| chlog | 2000000 | 0.022694 | 8.813e+07 | 2000000 | 0 |
+| spdlog | 2000000 | 0.080370 | 2.488e+07 | 2000000 | 0 |
 

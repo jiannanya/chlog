@@ -13,10 +13,13 @@
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -34,10 +37,16 @@
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+    #include <share.h>
+#endif
 
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
     #include <immintrin.h>
@@ -53,21 +62,35 @@ namespace chlog {
 
 namespace detail {
 
+// Borrow directly only for the exact built-in type. A subclass may override the
+// owning log() callback; it must keep receiving that callback through log_view().
+template <class T>
+bool exact_sink_type(const T& output) noexcept {
+#if defined(__cpp_rtti) || defined(_CPPRTTI)
+    return typeid(output) == typeid(T);
+#else
+    (void)output;
+    return false;
+#endif
+}
+
 // Configuration locks are cold and do not need a platform mutex per object.
 // Atomic waiting parks contending threads without retaining a spinning waiter.
 class compact_mutex {
 public:
     void lock() noexcept {
-        while (locked_.exchange(true, std::memory_order_acquire))
-            locked_.wait(true, std::memory_order_relaxed);
+        unsigned char expected = 0;
+        if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire)) return;
+        while (state_.exchange(2, std::memory_order_acquire) != 0)
+            state_.wait(2, std::memory_order_relaxed);
     }
     void unlock() noexcept {
-        locked_.store(false, std::memory_order_release);
-        locked_.notify_one();
+        if (state_.exchange(0, std::memory_order_release) == 2) state_.notify_one();
     }
 private:
-    // Some standard libraries retain a four-byte atomic_flag for ABI reasons.
-    std::atomic<bool> locked_{false};
+    // 0: unlocked, 1: locked, 2: locked with possible waiters. A slow-path
+    // owner preserves state 2 so every remaining waiter receives a handoff.
+    std::atomic<unsigned char> state_{0};
 };
 
 #if defined(CHLOG_USE_FMT)
@@ -86,9 +109,18 @@ inline std::string_view format_view(format_string<Args...> f) {
 #endif
 }
 
+template <class... Args>
+inline constexpr bool plain_string_argument = sizeof...(Args) == 1 &&
+    ((std::is_same_v<std::remove_cvref_t<Args>, std::string> ||
+      std::is_same_v<std::remove_cvref_t<Args>, std::string_view>) && ...);
 
 template <class... Args>
 inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
+    if constexpr (plain_string_argument<Args...>) {
+        // The unadorned string field already is the formatted payload. Keep
+        // ownership semantics: formatting an rvalue does not consume it.
+        if (format_view<Args...>(fmt) == "{}") return std::string(std::string_view(args)...);
+    }
     if constexpr (sizeof...(Args) == 0) {
         const auto text = format_view<>(fmt);
         if (text.find_first_of("{}") == std::string_view::npos) return std::string(text);
@@ -102,6 +134,9 @@ inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
 
 template <class... Args>
 inline std::string vformat_payload(std::string_view fmt, Args&&... args) {
+    if constexpr (plain_string_argument<Args...>) {
+        if (fmt == "{}") return std::string(std::string_view(args)...);
+    }
     if constexpr (sizeof...(Args) == 0) {
         if (fmt.find_first_of("{}") == std::string_view::npos) return std::string(fmt);
     }
@@ -278,6 +313,162 @@ inline std::tm localtime_safe(std::time_t t) noexcept {
 
 namespace detail {
 
+// A record-local buffer: short output stays on the stack, and unusually long
+// records release their storage when the callback returns. No shared/TLS state.
+class text_buffer {
+public:
+    using value_type = char;
+    text_buffer() = default;
+    text_buffer(const text_buffer&) = delete;
+    text_buffer& operator=(const text_buffer&) = delete;
+    const char* data() const noexcept { return data_; }
+    std::size_t size() const noexcept { return size_; }
+    std::string_view view() const noexcept { return {data_, size_}; }
+    void append(const char* text, std::size_t count) {
+        if (count > capacity_ - size_) grow(count);
+        if (count) std::memcpy(data_ + size_, text, count);
+        size_ += count;
+    }
+    void append(std::string_view text) { append(text.data(), text.size()); }
+    text_buffer& operator+=(std::string_view text) { append(text); return *this; }
+    void push_back(char c) {
+        if (size_ == capacity_) grow(1);
+        data_[size_++] = c;
+    }
+private:
+    void grow(std::size_t extra) {
+        constexpr auto limit = static_cast<std::size_t>((std::numeric_limits<std::ptrdiff_t>::max)());
+        if (extra > limit - size_) throw std::length_error("chlog: rendered record too large");
+        const auto required = size_ + extra;
+        // Leave room for the newline and small suffixes after a large payload.
+        const auto next = (std::max)(required + (std::min)(std::size_t{64}, limit - required),
+                                    capacity_ + (std::min)(capacity_ / 2, limit - capacity_));
+        auto storage = std::unique_ptr<char[]>(new char[next]);
+        std::memcpy(storage.get(), data_, size_);
+        heap_ = std::move(storage);
+        data_ = heap_.get();
+        capacity_ = next;
+    }
+    char inline_[512];
+    std::unique_ptr<char[]> heap_;
+    char* data_ = inline_;
+    std::size_t size_ = 0, capacity_ = sizeof(inline_);
+};
+
+// The owning sink serializes access, or explicitly operates in single-threaded
+// mode. Accumulate short records before entering the CRT; large writes bypass
+// the buffer. Storage is allocated on first use and retained across rotation.
+class file_writer {
+public:
+    file_writer() = default;
+    file_writer(const file_writer&) = delete;
+    file_writer& operator=(const file_writer&) = delete;
+    ~file_writer() { try { close(); } catch (...) {} }
+    bool is_open() const noexcept { return file_ != nullptr; }
+    void open(const std::filesystem::path& path) {
+        if (file_) throw std::logic_error("chlog: file already open");
+#ifdef _WIN32
+        // Preserve stream-style sharing so readers can tail an active log.
+        file_ = ::_wfsopen(path.c_str(), L"ab", _SH_DENYNO);
+#else
+        file_ = std::fopen(path.c_str(), "ab");
+#endif
+        if (!file_) fail();
+        error_ = 0;
+        used_ = 0;
+        // Use one buffering layer. The CRT still owns the file handle and keeps
+        // platform path/sharing semantics, but allocates no second data buffer.
+        if (std::setvbuf(file_, nullptr, _IONBF, 0) != 0) fail();
+    }
+    void write(const char* data, std::size_t size) {
+        check();
+        if (buffer_ && size <= buffer_capacity - used_) {
+            if (size) std::memcpy(buffer_.get() + used_, data, size);
+            used_ += size;
+            return;
+        }
+        write_tail(data, size);
+    }
+    void write_line(std::string_view text) {
+        check();
+        if (buffer_ && text.size() < buffer_capacity - used_) {
+            if (!text.empty()) std::memcpy(buffer_.get() + used_, text.data(), text.size());
+            used_ += text.size();
+            buffer_[used_++] = '\n';
+            return;
+        }
+        write(text.data(), text.size());
+        write("\n", 1);
+    }
+    void flush() {
+        check();
+        drain();
+#ifdef _WIN32
+        const auto result = ::_fflush_nolock(file_);
+#else
+        const auto result = std::fflush(file_);
+#endif
+        if (result != 0) fail();
+    }
+    void close() {
+        if (!file_) return;
+        try { flush(); }
+        catch (...) {
+            std::fclose(std::exchange(file_, nullptr));
+            used_ = 0;
+            throw;
+        }
+        auto* file = std::exchange(file_, nullptr);
+        error_ = 0;
+        if (std::fclose(file) != 0) fail();
+    }
+private:
+    void write_direct(const char* data, std::size_t size) {
+#ifdef _WIN32
+        const auto written = ::_fwrite_nolock(data, 1, size, file_);
+#elif defined(__GLIBC__) && defined(__USE_MISC)
+        const auto written = ::fwrite_unlocked(data, 1, size, file_);
+#else
+        const auto written = std::fwrite(data, 1, size, file_);
+#endif
+        if (written != size) fail();
+    }
+    void drain() {
+        // A failed partial write must never be replayed by close/destruction.
+        const auto size = std::exchange(used_, 0);
+        if (size) write_direct(buffer_.get(), size);
+    }
+    void write_tail(const char* data, std::size_t size) {
+        if (used_) {
+            const auto count = (std::min)(size, buffer_capacity - used_);
+            std::memcpy(buffer_.get() + used_, data, count);
+            used_ += count;
+            data += count;
+            size -= count;
+            drain();
+        }
+        if (size >= buffer_capacity) { write_direct(data, size); return; }
+        if (!size) return;
+        if (!buffer_) buffer_.reset(new char[buffer_capacity]);
+        std::memcpy(buffer_.get(), data, size);
+        used_ = size;
+    }
+    void check() const {
+        if (error_ || !file_)
+            throw std::ios_base::failure("chlog: log file unavailable",
+                std::error_code(error_ ? error_ : EBADF, std::generic_category()));
+    }
+    [[noreturn]] void fail() {
+        error_ = errno ? errno : EIO;
+        throw std::ios_base::failure("chlog: log file I/O", std::error_code(error_, std::generic_category()));
+    }
+    std::FILE* file_ = nullptr;
+    static constexpr std::size_t buffer_capacity = 4096;
+    std::unique_ptr<char[]> buffer_;
+    std::size_t used_ = 0;
+    int error_ = 0;
+};
+
 struct time_parts {
     std::chrono::sys_seconds second{};
     bool valid = false;
@@ -300,7 +491,8 @@ inline const time_parts& cached_time(std::chrono::system_clock::time_point tp) {
     return cache;
 }
 
-inline void append_milliseconds(std::string& out, std::chrono::system_clock::time_point tp) {
+template <class Output>
+inline void append_milliseconds(Output& out, std::chrono::system_clock::time_point tp) {
     auto ms = std::chrono::floor<std::chrono::milliseconds>(tp.time_since_epoch()).count() % 1000;
     if (ms < 0) ms += 1000;
     out.push_back(static_cast<char>('0' + ms / 100));
@@ -308,16 +500,40 @@ inline void append_milliseconds(std::string& out, std::chrono::system_clock::tim
     out.push_back(static_cast<char>('0' + ms % 10));
 }
 
-template <class T>
-inline void append_number(std::string& out, T value) {
+template <class Output, class T>
+inline void append_number(Output& out, T value) {
     char buf[32];
     const auto result = std::to_chars(buf, buf + sizeof(buf), value);
-    out.append(buf, result.ptr);
+    out.append(buf, static_cast<std::size_t>(result.ptr - buf));
 }
 
-inline void append_json_escaped(std::string& out, std::string_view s) {
+inline bool has_zero_byte(std::uint64_t word) noexcept {
+    return ((word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL) != 0;
+}
+
+template <class Output>
+inline void append_json_escaped(Output& out, std::string_view s) {
     constexpr char hex[] = "0123456789ABCDEF";
-    for (unsigned char c : s) {
+    std::size_t begin = 0, pos = 0;
+    while (pos < s.size()) {
+        // Scan ordinary text eight bytes at a time without reading past the
+        // string or assuming alignment. UTF-8 bytes pass through unchanged.
+        while (s.size() - pos >= sizeof(std::uint64_t)) {
+            std::uint64_t word;
+            std::memcpy(&word, s.data() + pos, sizeof(word));
+            if (has_zero_byte(word & 0xE0E0E0E0E0E0E0E0ULL) ||
+                has_zero_byte(word ^ 0x2222222222222222ULL) ||
+                has_zero_byte(word ^ 0x5C5C5C5C5C5C5C5CULL)) break;
+            pos += sizeof(word);
+        }
+        while (pos < s.size()) {
+            const auto c = static_cast<unsigned char>(s[pos]);
+            if (c < 0x20 || c == '"' || c == '\\') break;
+            ++pos;
+        }
+        if (pos == s.size()) break;
+        if (pos != begin) out.append(s.data() + begin, pos - begin);
+        const auto c = static_cast<unsigned char>(s[pos++]);
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -327,13 +543,13 @@ inline void append_json_escaped(std::string& out, std::string_view s) {
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
             default:
-                if (c < 0x20) {
-                    out += "\\u00";
-                    out.push_back(hex[c >> 4]);
-                    out.push_back(hex[c & 15]);
-                } else out.push_back(static_cast<char>(c));
+                out += "\\u00";
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 15]);
         }
+        begin = pos;
     }
+    if (pos != begin) out.append(s.data() + begin, pos - begin);
 }
 } // namespace detail
 
@@ -380,11 +596,12 @@ inline std::string json_escape(std::string_view s) {
 }
 
 namespace detail {
-inline std::string render_json(const log_event& e) {
-    std::string out;
-    out.reserve(160 + e.name.size() + e.payload.size() +
-                std::char_traits<char>::length(e.loc.file_name()) +
-                std::char_traits<char>::length(e.loc.function_name()));
+template <class Event, class Output>
+inline void render_json_to(const Event& e, Output& out) {
+    if constexpr (std::is_same_v<Output, std::string>)
+        out.reserve(out.size() + 160 + e.name.size() + e.payload.size() +
+                    std::char_traits<char>::length(e.loc.file_name()) +
+                    std::char_traits<char>::length(e.loc.function_name()));
     out += "{\"ts\":\"";
     out.append(cached_time(e.ts).timestamp.data(), 19);
     out.push_back('.');
@@ -406,6 +623,11 @@ inline std::string render_json(const log_event& e) {
     out += "\",\"msg\":\"";
     append_json_escaped(out, e.payload);
     out += "\"}";
+}
+template <class Event>
+inline std::string render_json(const Event& e) {
+    std::string out;
+    render_json_to(e, out);
     return out;
 }
 
@@ -414,6 +636,7 @@ class compiled_pattern {
     struct part { token kind; std::size_t begin; std::size_t size; };
     std::string pattern_;
     std::vector<part> parts_;
+    bool needs_calendar_ = false;
 public:
     explicit compiled_pattern(std::string pattern) : pattern_(std::move(pattern)) {
         if (pattern_ == "{msg}" || pattern_ == "{json}") return;
@@ -421,6 +644,17 @@ public:
         std::size_t literal = 0;
         for (std::size_t pos = 0; pos < pattern_.size(); ++pos) {
             if (pattern_[pos] != '{') continue;
+            constexpr std::string_view calendar = "{date} {time}.{ms}";
+            if (std::string_view(pattern_).substr(pos).starts_with(calendar)) {
+                // This common spelling is exactly {ts}. Coalesce it while
+                // compiling, avoiding five separate parts on every record.
+                if (pos > literal) parts_.push_back({token::literal, literal, pos - literal});
+                parts_.push_back({token::ts, 0, 0});
+                needs_calendar_ = true;
+                pos += calendar.size() - 1;
+                literal = pos + 1;
+                continue;
+            }
             const auto end = pattern_.find('}', pos + 1);
             if (end == std::string::npos) break;
             const auto key = std::string_view(pattern_).substr(pos + 1, end - pos - 1);
@@ -428,6 +662,7 @@ public:
                 if (key != names[i]) continue;
                 if (pos > literal) parts_.push_back({token::literal, literal, pos - literal});
                 parts_.push_back({static_cast<token>(i), 0, 0});
+                if (i <= static_cast<std::size_t>(token::time)) needs_calendar_ = true;
                 pos = end;
                 literal = end + 1;
                 break;
@@ -436,21 +671,23 @@ public:
         if (literal < pattern_.size()) parts_.push_back({token::literal, literal, pattern_.size() - literal});
     }
 
-    std::string render(const log_event& e) const {
-        if (pattern_ == "{msg}") return e.payload;
-        if (pattern_ == "{json}") return render_json(e);
-        std::string out;
-        out.reserve(pattern_.size() + e.payload.size() + e.name.size() + 64);
+    template <class Event, class Output>
+    void render_to(const Event& e, Output& out) const {
+        if (pattern_ == "{msg}") { out += e.payload; return; }
+        if (pattern_ == "{json}") { render_json_to(e, out); return; }
+        if constexpr (std::is_same_v<Output, std::string>)
+            if (!parts_.empty()) out.reserve(out.size() + pattern_.size() + e.payload.size() + e.name.size() + 64);
+        const auto* calendar = needs_calendar_ ? cached_time(e.ts).timestamp.data() : nullptr;
         for (const auto& p : parts_) {
             switch (p.kind) {
-                case token::literal: out.append(pattern_, p.begin, p.size); break;
+                case token::literal: out.append(pattern_.data() + p.begin, p.size); break;
                 case token::ts:
-                    out.append(cached_time(e.ts).timestamp.data(), 19);
+                    out.append(calendar, 19);
                     out.push_back('.');
                     append_milliseconds(out, e.ts);
                     break;
-                case token::date: out.append(cached_time(e.ts).timestamp.data(), 10); break;
-                case token::time: out.append(cached_time(e.ts).timestamp.data() + 11, 8); break;
+                case token::date: out.append(calendar, 10); break;
+                case token::time: out.append(calendar + 11, 8); break;
                 case token::ms: append_milliseconds(out, e.ts); break;
                 case token::lvl: out += level_name(e.lvl); break;
                 case token::tid: out += cached_thread_id(e.tid); break;
@@ -461,6 +698,11 @@ public:
                 case token::func: out += e.loc.function_name(); break;
             }
         }
+    }
+    template <class Event>
+    std::string render(const Event& e) const {
+        std::string out;
+        render_to(e, out);
         return out;
     }
 };
@@ -504,14 +746,49 @@ protected:
     std::atomic<level> level_{level::trace};
     bool thread_safe_ = true;
 
-    bool accepts(const log_event& e) const {
+    bool message_pattern() const noexcept {
+        return pattern_kind_.load(std::memory_order_acquire) == pattern_kind::message;
+    }
+
+    template <class Event>
+    bool accepts(const Event& e) const {
         const auto threshold = level_threshold();
         return e.lvl != level::off && threshold != level::off && e.lvl >= threshold;
     }
-    std::string render(const log_event& e) const {
+    // Appends one record; callers may reuse a string or use a local buffer.
+    template <class Event, class Output>
+    void render_to(const Event& e, Output& out) const {
         for (;;) {
             switch (pattern_kind_.load(std::memory_order_acquire)) {
-                case pattern_kind::message: return e.payload;
+                case pattern_kind::message: out += e.payload; return;
+                case pattern_kind::json: detail::render_json_to(e, out); return;
+                case pattern_kind::default_pattern: default_pattern()->render_to(e, out); return;
+                case pattern_kind::compiled: {
+                    if (!thread_safe_) { compiled_->render_to(e, out); return; }
+                    if constexpr (std::is_same_v<Output, detail::text_buffer>) {
+                        // Local rendering has no user callback or I/O. Keep the
+                        // snapshot alive with the lock instead of two refcounts.
+                        std::lock_guard<detail::compact_mutex> lock(pattern_mutex_);
+                        if (compiled_) { compiled_->render_to(e, out); return; }
+                    } else {
+                        std::shared_ptr<const detail::compiled_pattern> compiled;
+                        {
+                            std::lock_guard<detail::compact_mutex> lock(pattern_mutex_);
+                            compiled = compiled_;
+                        }
+                        if (compiled) { compiled->render_to(e, out); return; }
+                    }
+                    // A simple pattern replaced the snapshot before the lock.
+                    break;
+                }
+            }
+        }
+    }
+    template <class Event>
+    std::string render(const Event& e) const {
+        for (;;) {
+            switch (pattern_kind_.load(std::memory_order_acquire)) {
+                case pattern_kind::message: return std::string(e.payload);
                 case pattern_kind::json: return detail::render_json(e);
                 case pattern_kind::default_pattern: return default_pattern()->render(e);
                 case pattern_kind::compiled: {
@@ -522,7 +799,6 @@ protected:
                         compiled = compiled_;
                     }
                     if (compiled) return compiled->render(e);
-                    // A simple pattern replaced the snapshot before the lock.
                     break;
                 }
             }
@@ -558,25 +834,28 @@ public:
     enum class style { plain, color };
     explicit console_sink(style s = style::plain) : style_(s) {}
 
-    void log(const log_event& e) override {
-        if (!accepts(e)) return;
-        const auto line = render(e);
-        if (thread_safe_) {
-            std::lock_guard<std::mutex> lk(m_);
-            if (style_ == style::color) {
-                std::cout << color_of(e.lvl) << line << "\x1b[0m\n";
-            } else {
-                std::cout << line << '\n';
-            }
-        } else {
-            if (style_ == style::color) {
-                std::cout << color_of(e.lvl) << line << "\x1b[0m\n";
-            } else {
-                std::cout << line << '\n';
-            }
-        }
+    bool uses_views() const noexcept override { return detail::exact_sink_type(*this); }
+    void log(const log_event& e) override { consume(e); }
+    void log_view(const log_event_view& e) override {
+        if (detail::exact_sink_type(*this)) consume(e);
+        else sink::log_view(e);
     }
 
+private:
+    template <class Event>
+    void consume(const Event& e) {
+        if (!accepts(e)) return;
+        detail::text_buffer line;
+        if (style_ == style::color) line += color_of(e.lvl);
+        render_to(e, line);
+        if (style_ == style::color) line += "\x1b[0m";
+        line.push_back('\n');
+        std::unique_lock<std::mutex> lk(m_, std::defer_lock);
+        if (thread_safe_) lk.lock();
+        std::cout.write(line.data(), static_cast<std::streamsize>(line.size()));
+    }
+
+public:
     void flush() override {
         if (thread_safe_) {
             std::lock_guard<std::mutex> lk(m_);
@@ -610,23 +889,29 @@ public:
         : path_(std::move(path)), max_bytes_(max_bytes), max_files_(max_files ? max_files : 1) {
         if (max_bytes_ == 0) throw std::invalid_argument("chlog: max_bytes must be positive");
         if (!path_.parent_path().empty()) std::filesystem::create_directories(path_.parent_path());
-        file_.exceptions(std::ios::badbit | std::ios::failbit);
         open();
     }
 
-    void log(const log_event& e) override {
-        if (!accepts(e)) return;
-        const auto line = render(e);
-        std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-        if (thread_safe_) lk.lock();
-        if (!file_.is_open()) open();
-        // Rotate before a record, keeping records intact. A single oversized record
-        // occupies its own file and is rotated on the next write.
-        if (bytes_ > 0 && (bytes_ >= max_bytes_ || line.size() >= max_bytes_ - bytes_)) rotate();
-        file_ << line << '\n';
-        bytes_ += line.size() + 1;
+    bool uses_views() const noexcept override { return detail::exact_sink_type(*this); }
+    void log(const log_event& e) override { consume(e); }
+    void log_view(const log_event_view& e) override {
+        if (detail::exact_sink_type(*this)) consume(e);
+        else sink::log_view(e);
     }
 
+private:
+    template <class Event>
+    void consume(const Event& e) {
+        if (!accepts(e)) return;
+        if (message_pattern()) write_record(e.payload);
+        else {
+            detail::text_buffer line;
+            render_to(e, line);
+            write_record(line.view());
+        }
+    }
+
+public:
     void flush() override {
         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
         if (thread_safe_) lk.lock();
@@ -634,14 +919,22 @@ public:
     }
 
 private:
+    void write_record(std::string_view line) {
+        std::unique_lock<std::mutex> lk(m_, std::defer_lock);
+        if (thread_safe_) lk.lock();
+        if (!file_.is_open()) open();
+        // Account for the newline before rotation; never split a record across files.
+        if (bytes_ > 0 && (bytes_ >= max_bytes_ || line.size() >= max_bytes_ - bytes_)) rotate();
+        file_.write_line(line);
+        bytes_ += line.size() + 1;
+    }
     std::filesystem::path numbered(std::size_t n) const {
         auto result = path_;
         result += "." + std::to_string(n);
         return result;
     }
     void open() {
-        file_.clear();
-        file_.open(path_, std::ios::out | std::ios::app | std::ios::binary);
+        file_.open(path_);
         bytes_ = static_cast<std::size_t>(std::filesystem::file_size(path_));
     }
     void rotate() {
@@ -659,7 +952,7 @@ private:
     std::filesystem::path path_;
     std::size_t max_bytes_{};
     std::size_t max_files_{};
-    std::ofstream file_;
+    detail::file_writer file_;
     std::size_t bytes_ = 0;
     std::mutex m_;
 };
@@ -668,24 +961,35 @@ class daily_file_sink : public sink {
 public:
     explicit daily_file_sink(std::filesystem::path dir) : dir_(std::move(dir)) {
         if (!dir_.empty()) std::filesystem::create_directories(dir_);
-        file_.exceptions(std::ios::badbit | std::ios::failbit);
         open(date_string(std::chrono::system_clock::now()));
     }
     unsigned required_metadata() const noexcept override { return timestamp; }
 
-    void log(const log_event& e) override {
+    bool uses_views() const noexcept override { return detail::exact_sink_type(*this); }
+    void log(const log_event& e) override { consume(e); }
+    void log_view(const log_event_view& e) override {
+        if (detail::exact_sink_type(*this)) consume(e);
+        else sink::log_view(e);
+    }
+
+private:
+    template <class Event>
+    void consume(const Event& e) {
         if (!accepts(e)) return;
         const auto day = date_string(e.ts);
-        const auto line = render(e);
+        detail::text_buffer line;
+        render_to(e, line);
+        line.push_back('\n');
         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
         if (thread_safe_) lk.lock();
         if (day != current_day_ || !file_.is_open()) {
             if (file_.is_open()) file_.close();
             open(day);
         }
-        file_ << line << '\n';
+        file_.write(line.data(), line.size());
     }
 
+public:
     void flush() override {
         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
         if (thread_safe_) lk.lock();
@@ -694,13 +998,12 @@ public:
 
 private:
     void open(const std::string& day) {
-        file_.clear();
-        file_.open(dir_ / (day + ".log"), std::ios::out | std::ios::app | std::ios::binary);
+        file_.open(dir_ / (day + ".log"));
         current_day_ = day;
     }
     std::filesystem::path dir_;
     std::string current_day_;
-    std::ofstream file_;
+    detail::file_writer file_;
     std::mutex m_;
 };
 
@@ -708,26 +1011,37 @@ class json_sink : public sink {
 public:
     explicit json_sink(std::filesystem::path path) {
         if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
-        file_.exceptions(std::ios::badbit | std::ios::failbit);
-        file_.open(path, std::ios::out | std::ios::app | std::ios::binary);
+        file_.open(path);
     }
     unsigned required_metadata() const noexcept override { return all_metadata; }
 
-    void log(const log_event& e) override {
-        if (!accepts(e)) return;
-        const auto line = detail::render_json(e);
-        std::unique_lock<std::mutex> lk(m_, std::defer_lock);
-        if (thread_safe_) lk.lock();
-        file_ << line << '\n';
+    bool uses_views() const noexcept override { return detail::exact_sink_type(*this); }
+    void log(const log_event& e) override { consume(e); }
+    void log_view(const log_event_view& e) override {
+        if (detail::exact_sink_type(*this)) consume(e);
+        else sink::log_view(e);
     }
 
+private:
+    template <class Event>
+    void consume(const Event& e) {
+        if (!accepts(e)) return;
+        detail::text_buffer line;
+        detail::render_json_to(e, line);
+        line.push_back('\n');
+        std::unique_lock<std::mutex> lk(m_, std::defer_lock);
+        if (thread_safe_) lk.lock();
+        file_.write(line.data(), line.size());
+    }
+
+public:
     void flush() override {
         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
         if (thread_safe_) lk.lock();
         file_.flush();
     }
 private:
-    std::ofstream file_;
+    detail::file_writer file_;
     std::mutex m_;
 };
 
@@ -1397,6 +1711,9 @@ private:
     void submit_format(level lv, const std::source_location& loc, detail::format_string<Args...> fmt, Args&&... args) {
         if (inline_dispatch()) {
             const auto text = detail::format_view<Args...>(fmt);
+            if constexpr (detail::plain_string_argument<Args...>) {
+                if (text == "{}") { submit_view(lv, loc, std::string_view(args)...); return; }
+            }
             if constexpr (sizeof...(Args) == 0) {
                 if (text.find_first_of("{}") == std::string_view::npos) {
                     submit_view(lv, loc, text);
@@ -1418,6 +1735,9 @@ private:
     template <class... Args>
     void submit_runtime(level lv, const std::source_location& loc, std::string_view fmt, Args&&... args) {
         if (inline_dispatch()) {
+            if constexpr (detail::plain_string_argument<Args...>) {
+                if (fmt == "{}") { submit_view(lv, loc, std::string_view(args)...); return; }
+            }
             if constexpr (sizeof...(Args) == 0) {
                 if (fmt.find_first_of("{}") == std::string_view::npos) { submit_view(lv, loc, fmt); return; }
             }

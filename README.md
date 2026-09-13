@@ -60,9 +60,15 @@ These results use atomic counter sinks and exclude disk I/O. Async cases use equ
 Library metadata policies differ; see the [full methodology and results](docs/logbench_results.md)
 and [raw measurements](docs/logbench_results.json).
 
+The [file-output comparison](docs/logbench_output.md) measures the built-in file
+sinks with 128 B and 1 KiB messages, both message-only and full timestamp patterns.
+It includes buffer flushing and async draining, and validates every output record.
+Filesystem caching and concurrent I/O affect these results.
+
 The [memory comparison](docs/logbench_memory.md) covers 13 B, 128 B and 1 KiB
 messages, including a full queue. It reports process memory separately from C++
-allocation diagnostics, including 1,000 and 10,000 synchronous instances. With one
+allocation diagnostics, including 1,000 and 10,000 synchronous instances and
+32 and 128 simultaneously open file sinks with live write buffers. With one
 view counter sink and `parallel_sinks = false`, a synchronous instance retains
 288 B for chlog and 352 B for spdlog; construction peaks are also 288 B and 352 B.
 These figures describe this benchmark configuration.
@@ -228,6 +234,8 @@ No-argument messages without braces bypass the formatting backend; escaped brace
 and runtime format errors keep their usual formatting behavior.
 
 File sinks open in binary mode for exact byte accounting and throw on open failures.
+They allocate a 4 KiB write buffer on first buffered write, with CRT data buffering
+disabled. Flushing and closing drain the pending bytes; rotation reuses the buffer.
 Rotating files keep whole records, rotate before overflow, and retain up to `max_files`
 backups. A record larger than `max_bytes` occupies a file by itself; `max_bytes = 0`
 is rejected. Write/rotation failures are counted in logger errors. On platforms whose
@@ -425,6 +433,22 @@ Generate the Windows memory comparison in fresh processes:
 python ./tools/logbench_memory.py --build-dir build-ninja-clang --out docs/logbench_memory.md --repeats 5
 python ./tools/logbench_plot.py --in docs/logbench_results.json --memory docs/logbench_memory.json --out docs/logbench_summary.svg
 ```
+
+Measure file output with matched payloads, patterns and LF newlines:
+
+```powershell
+python ./tools/logbench_output.py --build-dir build-ninja-clang --out docs/logbench_output.md --iters 100000 --short-iters 500000 --repeats 7
+```
+
+Direct instances of the built-in sinks consume borrowed records when RTTI is
+available. Subclasses keep their owning `log()` callback, and builds without RTTI
+use the owning path. Construct sinks fully before registering them with a logger.
+Formatted sink output uses a local 512-byte buffer, with temporary heap storage for
+long records. Message-only rotating-file output writes the payload into the file
+buffer directly. Temporary rendering storage is released after the callback.
+Custom sinks can append rendered output to a caller-owned string with
+`render_to(event, output)`; both `log_event` and `log_event_view` are supported.
+Use separate storage for the event fields and the output buffer.
 
 To run a fresh chlog vs spdlog comparison and regenerate the chart:
 

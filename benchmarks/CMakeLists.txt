@@ -4,9 +4,14 @@ add_executable(chlog_bench_loggers
 
 target_link_libraries(chlog_bench_loggers PRIVATE chlog::chlog)
 
+add_executable(chlog_bench_output ${CMAKE_CURRENT_LIST_DIR}/output_bench.cpp)
+target_link_libraries(chlog_bench_output PRIVATE chlog::chlog)
+
 # spdlog is optional (but recommended for comparisons)
 find_package(spdlog CONFIG QUIET)
 if (spdlog_FOUND)
+  target_link_libraries(chlog_bench_output PRIVATE spdlog::spdlog)
+  target_compile_definitions(chlog_bench_output PRIVATE CHLOG_HAS_SPDLOG=1)
   add_executable(chlog_bench_memory ${CMAKE_CURRENT_LIST_DIR}/memory_bench.cpp)
   target_link_libraries(chlog_bench_memory PRIVATE chlog::chlog spdlog::spdlog)
   add_executable(chlog_bench_allocations ${CMAKE_CURRENT_LIST_DIR}/memory_bench.cpp)
@@ -17,6 +22,8 @@ if (spdlog_FOUND)
   # Some spdlog packages use std::format or do not export fmt headers.
   find_package(fmt CONFIG QUIET)
   if (fmt_FOUND AND NOT CHLOG_USE_FMT)
+    target_link_libraries(chlog_bench_output PRIVATE fmt::fmt)
+    target_compile_definitions(chlog_bench_output PRIVATE CHLOG_USE_FMT=1)
     target_link_libraries(chlog_bench_memory PRIVATE fmt::fmt)
     target_compile_definitions(chlog_bench_memory PRIVATE CHLOG_USE_FMT=1)
     target_link_libraries(chlog_bench_allocations PRIVATE fmt::fmt)
