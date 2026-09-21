@@ -48,10 +48,6 @@
     #include <share.h>
 #endif
 
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
-    #include <immintrin.h>
-#endif
-
 #if defined(CHLOG_USE_FMT)
     #include <fmt/format.h>
 #else
@@ -220,8 +216,8 @@ struct logger_config {
     } async;
 
     bool parallel_sinks = true;
-    std::size_t sink_pool_size = 0; // 0 => = sinks.size()
-    std::size_t sink_queue_capacity = 1024; // bounded parallel tasks; producers block when full
+    std::size_t sink_pool_size = 0; // 0 => one worker per sink (also forces a pool with one sink if > 0)
+    std::size_t sink_queue_capacity = 1024; // bounded pending tasks; producers block when full
 };
 
 // =========================== Events & Metrics ===========================
@@ -1057,6 +1053,33 @@ inline constexpr std::size_t round_up_pow2(std::size_t x) {
     return x + 1;
 }
 
+// Bounded spin-wait relaxation. The readiness check is an acquire load, so the
+// loop already re-reads memory; this helper only keeps that loop opaque to the
+// optimizer. It deliberately uses no CPU-specific instruction and no inline
+// assembly: a target that provides a "pause"/"yield" hint is not required, and
+// every architecture compiles the same code. Correctness never depends on the
+// hint - the semaphore handshake below covers every sleep transition - so the
+// spin phase is a latency optimization only.
+inline void spin_backoff(unsigned iteration) noexcept {
+    if (iteration < 32u) std::atomic_signal_fence(std::memory_order_seq_cst);
+    else std::this_thread::yield();
+}
+
+// Lock for extremely short critical sections (a few pointer or index updates).
+// Parking a thread and waking it again costs far more than the work it protects,
+// so the contending thread spins instead and only yields after a bounded number
+// of attempts. Never used for critical sections that can block or allocate.
+class spin_mutex {
+public:
+    void lock() noexcept {
+        for (unsigned retry = 0; flag_.exchange(true, std::memory_order_acquire); ++retry)
+            while (flag_.load(std::memory_order_relaxed)) spin_backoff(retry);
+    }
+    void unlock() noexcept { flag_.store(false, std::memory_order_release); }
+private:
+    std::atomic<bool> flag_{false};
+};
+
 struct queue_wait {
     std::atomic<bool> sleeping{false};
     std::binary_semaphore sem_not_empty{0};
@@ -1079,11 +1102,7 @@ struct queue_wait {
         // the semaphore handshake below still handles every sleep transition.
         for (unsigned retry = 0; retry < 32 && duration.count() > 0; ++retry) {
             if (ready() || stop.load(std::memory_order_acquire)) return;
-#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
-            _mm_pause();
-#else
-            std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
+            spin_backoff(retry);
         }
         sleeping.exchange(true, std::memory_order_acq_rel);
         if (ready() || stop.load(std::memory_order_acquire)) {
@@ -1269,6 +1288,237 @@ private:
     bool low_first_ = false;
 };
 
+// =========================== Parallel Sink Dispatch ===========================
+//
+// One record fanned out to N sinks used to cost N+ allocator calls plus a
+// std::function, a queue node and a shared_ptr, and every task took a mutex and
+// woke a condition variable. The structures below keep the same observable
+// behaviour (one task per sink, bounded pending tasks, per-record level flushes,
+// one dequeued count per record) with no per-record allocation:
+//   * a task is a trivially copyable {job, sink} pair,
+//   * jobs are recycled through a chunked free list, and
+//   * pending tasks live in a bounded task ring drained in batches.
+namespace detail {
+
+// Unit of work for the parallel sink pool. Trivially copyable, so it can be
+// stored in a ring directly instead of behind std::function.
+struct sink_task {
+    struct parallel_job* job = nullptr;
+    sink* output = nullptr;
+};
+
+// One record in flight. Tasks keep it alive with an intrusive reference count;
+// the last task to finish returns it to the pool.
+struct parallel_job {
+    log_event event;
+    std::atomic<std::size_t> remaining{0};
+    bool flush_event = false;
+    parallel_job* next_free = nullptr;
+};
+
+// Chunked job recycling for the parallel pool. Chunks are held until the
+// owning pool is destroyed, so a handed-out job
+// pointer stays valid for the pool's lifetime; the number of live jobs is
+// bounded by the high-water mark of records in flight, not by the record count.
+//
+// The free list is deliberately split so that no lock is shared between the
+// logging threads and the workers:
+//   * a worker retires a finished job onto a lock-free stack with one CAS; a
+//     node is never unlinked individually (a producer takes the whole stack at
+//     once), so no ABA tagging is needed on this path;
+//   * a logging thread acquires from its own cached list and only touches the
+//     shared stack - or allocates a chunk - when that list runs dry.
+// The only lock is the one protecting the acquire cache, which workers never
+// touch. It therefore stays on the logging threads' side instead of bouncing
+// between producers and workers for every record.
+class job_pool {
+public:
+    parallel_job* acquire() {
+        std::lock_guard<spin_mutex> lock(mutex_);
+        if (!cache_) {
+            cache_ = returns_.exchange(nullptr, std::memory_order_acq_rel);
+            if (!cache_) grow();
+        }
+        auto* job = cache_;
+        cache_ = job->next_free;
+        job->next_free = nullptr;
+        return job;
+    }
+    // Called by the worker that completes the record.
+    void retire(parallel_job* job) noexcept {
+        // Payload and name are not retained: the next record move-assigns a
+        // freshly built string into the job, which frees these buffers anyway.
+        // Releasing them here keeps a burst of large messages from pinning
+        // memory for the pool's lifetime and moves the free off the producer.
+        std::string{}.swap(job->event.payload);
+        std::string{}.swap(job->event.name);
+        job->flush_event = false;
+        job->remaining.store(0, std::memory_order_relaxed);
+        auto* head = returns_.load(std::memory_order_relaxed);
+        do {
+            job->next_free = head;
+        } while (!returns_.compare_exchange_weak(head, job, std::memory_order_release,
+                                                 std::memory_order_relaxed));
+    }
+private:
+    void grow() {
+        constexpr std::size_t chunk = 32;
+        std::unique_ptr<parallel_job[]> block(new parallel_job[chunk]);
+        for (std::size_t i = 0; i < chunk; ++i) {
+            block[i].next_free = cache_;
+            cache_ = &block[i];
+        }
+        chunks_.push_back(std::move(block));
+    }
+    mutable spin_mutex mutex_;
+    parallel_job* cache_ = nullptr;
+    alignas(64) std::atomic<parallel_job*> returns_{nullptr};
+    std::vector<std::unique_ptr<parallel_job[]>> chunks_;
+};
+
+// Tasks are drained in batches; the buffer itself is reused by each worker.
+inline constexpr std::size_t sink_batch_max = 64;
+
+// Bounded multi-producer / multi-consumer queue of fixed-size sink tasks. Only a
+// job pointer travels through the queue, so no record ever allocates here. A
+// producer blocks once the pending count reaches the configured capacity - the
+// documented backpressure contract - and a stopping queue releases every blocked
+// producer so shutdown cannot hang behind a full pool.
+//
+// The ring itself is guarded by a spin lock: a push is a couple of index updates
+// and a task copy, so a contending producer must not pay a kernel park and wakeup.
+// Real waiting (queue full, or nothing to do) uses the condition variables, which
+// is why they are `condition_variable_any` - they accept the spin lock, and only
+// the genuinely idle paths ever reach them. A consumer also polls briefly before
+// parking, and a push only signals a consumer that actually parked, so a busy
+// pipeline stays entirely inside the producer and worker threads.
+class task_queue {
+public:
+    explicit task_queue(std::size_t capacity)
+        : capacity_((std::max)(std::size_t{1}, capacity)), buffer_(capacity_) {}
+    task_queue(const task_queue&) = delete;
+    task_queue& operator=(const task_queue&) = delete;
+
+    // Pushes tasks in chunks bounded by the batch size, so one record's fan-out
+    // costs one lock acquisition instead of one per sink. Returns how many were
+    // accepted; fewer only when the queue is stopping. A waiting producer is
+    // released by stop() and reports every remaining task as rejected.
+    std::size_t push_batch(const sink_task* tasks, std::size_t count) {
+        std::size_t pushed = 0;
+        while (pushed < count) {
+            const auto chunk = (std::min)(count - pushed, (std::min)(capacity_, sink_batch_max));
+            std::unique_lock<spin_mutex> lock(mutex_);
+            ++space_waiters_;
+            space_.wait(lock, [&] { return stopped_ || pending_ + chunk <= capacity_; });
+            --space_waiters_;
+            if (stopped_) return pushed;
+            for (std::size_t i = 0; i < chunk; ++i) {
+                buffer_[tail_] = tasks[pushed + i];
+                tail_ = tail_ + 1 == capacity_ ? 0 : tail_ + 1;
+            }
+            pending_ += chunk;
+            hint_.store(true, std::memory_order_relaxed);
+            const bool wake = parked_ != 0;
+            lock.unlock();
+            pushed += chunk;
+            if (wake) data_.notify_all();
+        }
+        return pushed;
+    }
+    // Blocks until at least one task is available or the queue stops. Returns 0
+    // only once the queue has stopped and drained. The drained tasks are counted
+    // as active until the caller reports them with finish_batch().
+    std::size_t pop_batch(sink_task* out, std::size_t max) {
+        for (unsigned retry = 0; retry < 32; ++retry) {
+            if (hint_.load(std::memory_order_relaxed)) {
+                std::unique_lock<spin_mutex> lock(mutex_);
+                const auto n = drain(out, max);
+                const bool wake = n != 0 && space_waiters_ != 0;
+                lock.unlock();
+                if (wake) space_.notify_all();
+                if (n) return n;
+            }
+            spin_backoff(retry);
+        }
+        std::unique_lock<spin_mutex> lock(mutex_);
+        ++parked_;
+        data_.wait(lock, [&] { return pending_ != 0 || stopped_; });
+        --parked_;
+        const auto n = drain(out, max);
+        const bool wake = n != 0 && space_waiters_ != 0;
+        lock.unlock();
+        if (wake) space_.notify_all();
+        return n;
+    }
+    // Reports tasks handed out by pop_batch() as fully processed.
+    void finish_batch(std::size_t count) {
+        std::unique_lock<spin_mutex> lock(mutex_);
+        active_ -= count;
+        if (active_ == 0 && pending_ == 0 && idle_waiters_ != 0) idle_.notify_all();
+    }
+    // Flush barrier: blocks until no task is queued and none is being processed.
+    // A record that is still being submitted counts as concurrent with the
+    // barrier, matching the documented flush contract.
+    void wait_idle() {
+        std::unique_lock<spin_mutex> lock(mutex_);
+        ++idle_waiters_;
+        idle_.wait(lock, [&] { return pending_ == 0 && active_ == 0; });
+        --idle_waiters_;
+    }
+    void stop() {
+        {
+            std::lock_guard<spin_mutex> lock(mutex_);
+            stopped_ = true;
+            hint_.store(false, std::memory_order_relaxed);
+        }
+        space_.notify_all();
+        data_.notify_all();
+        idle_.notify_all();
+    }
+    std::size_t pending() const {
+        std::lock_guard<spin_mutex> lock(mutex_);
+        return pending_;
+    }
+    // Tasks queued or being written by a worker; the "dequeued" statistic is
+    // derived from it without touching the logging path.
+    std::size_t outstanding() const {
+        std::lock_guard<spin_mutex> lock(mutex_);
+        return pending_ + active_;
+    }
+private:
+    // Requires the lock. Copies up to `max` tasks out, oldest first, and moves
+    // them from the pending count to the active count.
+    std::size_t drain(sink_task* out, std::size_t max) {
+        std::size_t count = 0;
+        while (count < max && pending_ != 0) {
+            out[count++] = buffer_[head_];
+            head_ = head_ + 1 == capacity_ ? 0 : head_ + 1;
+            --pending_;
+        }
+        active_ += count;
+        // Only this thread pushes the hint back down, and it holds the lock, so
+        // no producer can be interleaved between the test and the store.
+        if (pending_ == 0) hint_.store(false, std::memory_order_relaxed);
+        return count;
+    }
+    const std::size_t capacity_;
+    std::vector<sink_task> buffer_;
+    // Producer-written and consumer-polled purely as a heuristic ("work may be
+    // available"); relaxed suffices because a consumer that follows the hint
+    // takes the lock and re-checks pending_ before touching the ring. Split onto
+    // its own line to keep the ring indices and parked counter out of the same
+    // coherence traffic.
+    alignas(64) std::atomic<bool> hint_{false};
+    mutable spin_mutex mutex_;
+    std::condition_variable_any data_, space_, idle_;
+    std::size_t head_ = 0, tail_ = 0, pending_ = 0, space_waiters_ = 0;
+    std::size_t active_ = 0, idle_waiters_ = 0;
+    alignas(64) std::size_t parked_ = 0;
+    bool stopped_ = false;
+};
+
+} // namespace detail
+
 // =========================== Thread Pool ===========================
 
 class thread_pool {
@@ -1369,7 +1619,7 @@ public:
                             (cfg.capture_thread_id ? sink::thread_id : 0u) |
                             (cfg.capture_logger_name ? sink::logger_name : 0u) |
                             (cfg.capture_source_location ? sink::source_location : 0u))),
-          single_threaded_(cfg.single_threaded) {
+          pool_size_(cfg.sink_pool_size), single_threaded_(cfg.single_threaded) {
         pattern_.shrink_to_fit();
         capture_mask_.store(static_cast<unsigned char>(configured_metadata()), std::memory_order_relaxed);
         if (!single_threaded_ && cfg.async.enabled) {
@@ -1377,8 +1627,14 @@ public:
             queue_ = async_->queue.get();
             async_->worker = std::thread([this] { worker_loop(); });
         } else if (!single_threaded_ && cfg.parallel_sinks) {
+            // The pool itself starts with the second sink: a single destination
+            // has nothing to parallelize, so it is written by the caller until
+            // fan-out exists (an explicit sink_pool_size still forces a pool).
             parallel_ = std::make_unique<parallel_state>(cfg.sink_pool_size, cfg.sink_queue_capacity);
         }
+        // A queued logger always owns its records; otherwise the caller may
+        // format into view sinks until proven wrong (see inline_dispatch()).
+        inline_ok_.store(!queue_, std::memory_order_relaxed);
     }
     ~logger() {
         shutdown();
@@ -1399,17 +1655,18 @@ public:
         std::lock_guard<detail::compact_mutex> lk(sinks_mu_);
         s->set_pattern(pattern_);
         s->set_thread_safe(!single_threaded_);
-        if (!s->uses_views()) views_only_.store(false, std::memory_order_release);
+        if (!s->uses_views()) {
+            views_only_.store(false, std::memory_order_release);
+            inline_ok_.store(false, std::memory_order_release);
+        }
         required_metadata_ |= static_cast<unsigned char>(s->required_metadata());
         update_metadata();
         auto* previous = sinks_tail_.load(std::memory_order_relaxed);
         auto node = previous ? std::make_unique<sink_node>(std::move(s), previous->count + 1) : nullptr;
         auto* added = node ? node.get() : &first_sink_;
-        if (parallel_ && !parallel_->pool) {
-            parallel_->pool = std::make_unique<thread_pool>(parallel_->pool_size ? parallel_->pool_size : added->count,
-                                                          parallel_->capacity);
-            parallel_->published.store(parallel_->pool.get(), std::memory_order_release);
-        }
+        if (parallel_ && !parallel_->ready.load(std::memory_order_acquire) &&
+            (added->count >= 2 || pool_size_ != 0))
+            start_parallel(added->count);
         if (previous) {
             previous->next.store(node.release(), std::memory_order_release);
         } else first_sink_.output = std::move(s);
@@ -1553,7 +1810,7 @@ public:
                 async_->progress.wait(epoch, std::memory_order_acquire);
             }
         }
-        if (auto* pool = current_pool()) pool->wait_idle();
+        wait_parallel_idle();
         flush_sinks();
     }
     void shutdown() {
@@ -1582,7 +1839,7 @@ public:
             queue_->signal_stop();
             if (async_->worker.joinable()) async_->worker.join();
         }
-        if (parallel_ && parallel_->pool) parallel_->pool->shutdown();
+        if (parallel_ && parallel_->tasks) stop_parallel();
         flush_sinks();
         shutdown_done_ = true;
     }
@@ -1593,18 +1850,28 @@ public:
             const auto accepted = queue_->tails();
             result.enqueued = accepted.hi + accepted.lo;
         } else result.enqueued = static_cast<std::size_t>(counters().entries.load(std::memory_order_acquire) & ~closed_bit);
-        result.dequeued = async_ ? async_->dequeued.load(std::memory_order_acquire)
-            : parallel_ ? parallel_->dequeued.load(std::memory_order_acquire)
-            : static_cast<std::size_t>(counters().returns.load(std::memory_order_acquire));
+        // Completed records: everything whose call already returned minus the
+        // tasks still queued or being written. Exact once the pool has drained,
+        // and derived without adding any per-record work to the logging path.
+        if (async_) {
+            result.dequeued = async_->dequeued.load(std::memory_order_acquire);
+        } else if (parallel_ && parallel_->tasks) {
+            const auto outstanding = parallel_->tasks->outstanding();
+            const auto returned = static_cast<std::size_t>(counters().returns.load(std::memory_order_acquire));
+            result.dequeued = returned > outstanding ? returned - outstanding : 0;
+        } else {
+            result.dequeued = static_cast<std::size_t>(counters().returns.load(std::memory_order_acquire));
+        }
         result.flushed = static_cast<std::size_t>(flushed_.load(std::memory_order_relaxed));
         result.errors = static_cast<std::size_t>(errors_.load(std::memory_order_relaxed));
         if (queue_) result.queue_size = queue_->size_relaxed();
-        else if (auto* pool = current_pool()) result.queue_size = pool->queue_size();
+        else if (parallel_ && parallel_->tasks) result.queue_size = parallel_->tasks->pending();
         return result;
     }
     std::size_t queue_capacity() const noexcept { return queue_ ? queue_->capacity() : 0; }
 
 private:
+    struct parallel_state; // defined below with the rest of the dispatch state
     // The sink API only appends: nodes stay alive until shutdown has joined all
     // users. A captured tail bounds each traversal without refcount operations.
     struct sink_node {
@@ -1752,8 +2019,15 @@ private:
         }
         submit(lv, loc, [&] { return detail::vformat_payload(fmt, std::forward<Args>(args)...); }, fmt);
     }
+    // True when the record can go straight from the caller into view sinks:
+    // no queue and no running sink pool. A configured-but-idle pool does not
+    // block the inline path, so a single-destination logger formats directly
+    // into the sink's buffer instead of materializing a payload string. The
+    // decision only ever flips to false (a non-view sink appears, or the pool
+    // starts), so a relaxed load keeps this branch out of the memory-ordering
+    // critical path.
     bool inline_dispatch() const noexcept {
-        return !queue_ && !parallel_ && views_only_.load(std::memory_order_acquire);
+        return inline_ok_.load(std::memory_order_relaxed);
     }
     template <class Format>
     void submit_formatted_view(level lv, const std::source_location& loc, std::string_view fallback, Format format) {
@@ -1783,8 +2057,12 @@ private:
         e.lvl = lv;
         e.payload = message;
         e.seq = single_threaded_ ? increment_local(counters().entries) : sequence;
-        if (single_threaded_) { write_to(current_sinks(), e); increment_local(counters().returns); }
-        else if (auto current = current_sinks()) write_to(current, e);
+        if (single_threaded_) {
+            write_to(current_sinks(), e);
+            increment_local(counters().returns);
+        } else if (auto current = current_sinks()) {
+            write_to(current, e);
+        }
         if (should_flush(lv)) flush_sinks();
     }
     template <class Format>
@@ -1818,37 +2096,104 @@ private:
             return;
         }
         auto current = current_sinks();
-        auto* pool = current_pool();
-        if (pool && current && !current.empty()) {
+        if (auto* pool = current_parallel(); pool && current && !current.empty()) {
             // Each event owns its strings once; all per-sink tasks share it.
-            const bool flush_event = should_flush(lv);
-            auto job = std::make_shared<parallel_event>(std::move(e), current.size(), flush_event);
-            for (auto& output : current) {
-                try {
-                    if (pool->enqueue([this, output, job, flush_event] {
-                        write_one(*output, job->event);
-                        if (flush_event) flush_one(*output);
-                        finish_parallel(*job);
-                    })) continue;
-                } catch (...) { error(); }
-                finish_parallel(*job);
-            }
-        } else {
-            if (current) write_to(current, e);
-            if (parallel_) parallel_->dequeued.fetch_add(1, std::memory_order_release);
-            if (should_flush(lv)) flush_sinks();
+            submit_parallel(*pool, current, lv, std::move(e));
+            return;
         }
+        if (current) write_to(current, e);
+        if (should_flush(lv)) flush_sinks();
     }
-    struct parallel_event {
-        parallel_event(log_event&& e, std::size_t n, bool flush) : event(std::move(e)), remaining(n), flush_event(flush) {}
-        log_event event;
-        std::atomic<std::size_t> remaining;
-        bool flush_event;
-    };
-    void finish_parallel(parallel_event& job) noexcept {
+    // Publishes one task per sink into the bounded pool ring. The job's remaining
+    // count is set before the first task becomes visible, and a task that cannot
+    // be accepted (pool stopped) still consumes its reference, so the job is
+    // released exactly once.
+    void submit_parallel(parallel_state& pool, const sink_snapshot& current, level lv, log_event&& e) {
+        auto* job = pool.jobs.acquire();
+        job->event = std::move(e);
+        job->flush_event = should_flush(lv);
+        job->remaining.store(current.size(), std::memory_order_relaxed);
+        // Deliberately uninitialized: every entry handed to push_tasks() below
+        // has been written, and zero-filling 64 tasks per record is pure work.
+        std::array<detail::sink_task, detail::sink_batch_max> batch;
+        std::size_t n = 0;
+        bool stopped = false;
+        for (auto& output : current) {
+            if (stopped) {
+                finish_job(pool, *job);
+                continue;
+            }
+            batch[n++] = {job, output.get()};
+            if (n == batch.size()) {
+                stopped = !push_tasks(pool, batch.data(), n);
+                n = 0;
+            }
+        }
+        if (n) push_tasks(pool, batch.data(), n);
+    }
+    // Returns false when the queue was stopping, in which case the rejected
+    // tasks have already been accounted for.
+    bool push_tasks(parallel_state& pool, const detail::sink_task* tasks, std::size_t count) {
+        const auto pushed = pool.tasks->push_batch(tasks, count);
+        for (std::size_t i = pushed; i < count; ++i) finish_job(pool, *tasks[i].job);
+        return pushed == count;
+    }
+    void finish_job(parallel_state& pool, detail::parallel_job& job) noexcept {
         if (job.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             if (job.flush_event) flushed_.fetch_add(1, std::memory_order_relaxed);
-            parallel_->dequeued.fetch_add(1, std::memory_order_release);
+            pool.jobs.retire(&job); // Recycle for the next record.
+        }
+    }
+    void start_parallel(std::size_t sinks) {
+        const auto threads = (std::max)(std::size_t{1}, parallel_->pool_size ? parallel_->pool_size : sinks);
+        parallel_->stop.store(false, std::memory_order_relaxed);
+        parallel_->tasks = std::make_unique<detail::task_queue>(parallel_->capacity);
+        parallel_->workers.reserve(threads);
+        try {
+            for (std::size_t i = 0; i < threads; ++i)
+                parallel_->workers.emplace_back([this] { parallel_worker(); });
+        } catch (...) {
+            // Leave the logger fully functional in synchronous mode.
+            parallel_->stop.store(true, std::memory_order_release);
+            parallel_->tasks->stop();
+            for (auto& worker : parallel_->workers) if (worker.joinable()) worker.join();
+            parallel_->workers.clear();
+            throw;
+        }
+        inline_ok_.store(false, std::memory_order_relaxed);
+        parallel_->ready.store(true, std::memory_order_release);
+    }
+    void stop_parallel() noexcept {
+        parallel_->stop.store(true, std::memory_order_release);
+        parallel_->tasks->stop();
+        for (auto& worker : parallel_->workers) if (worker.joinable()) worker.join();
+        parallel_->workers.clear();
+    }
+    // Waits for every record accepted before the call: the queue must be empty
+    // and no worker may still hold a drained batch. Producers running
+    // concurrently are not blocked, so a record submitted during the barrier
+    // may still be in flight; sink implementations shared with logging threads
+    // must be thread-safe, which add_sink() already arranges for built-in
+    // sinks.
+    void wait_parallel_idle() {
+        if (current_parallel()) parallel_->tasks->wait_idle();
+    }
+    void parallel_worker() {
+        auto& pool = *parallel_;
+        std::array<detail::sink_task, detail::sink_batch_max> batch{};
+        for (;;) {
+            const auto n = pool.tasks->pop_batch(batch.data(), batch.size());
+            if (n == 0) {
+                if (pool.stop.load(std::memory_order_acquire)) break;
+                continue;
+            }
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto& task = batch[i];
+                write_one(*task.output, task.job->event);
+                if (task.job->flush_event) flush_one(*task.output);
+                finish_job(pool, *task.job);
+            }
+            pool.tasks->finish_batch(n);
         }
     }
     template <class Event>
@@ -1976,17 +2321,20 @@ private:
         alignas(64) log_counters counters;
     };
     struct parallel_state {
-        parallel_state(std::size_t threads, std::size_t pending) : pool_size(threads), capacity(pending) {}
-        const std::size_t pool_size, capacity;
-        std::unique_ptr<thread_pool> pool;
-        std::atomic<thread_pool*> published{nullptr};
-        std::atomic<std::size_t> dequeued{0};
+        parallel_state(std::size_t threads, std::size_t pending)
+            : pool_size(threads), capacity((std::max)(std::size_t{2}, pending)) {}
+        const std::size_t pool_size, capacity; // pool_size 0 => one worker per sink
+
+        std::unique_ptr<detail::task_queue> tasks;
+        std::vector<std::thread> workers;
+        detail::job_pool jobs; // also the flush barrier and the dequeued count
+        std::atomic<bool> ready{false}, stop{false};
     };
     log_counters& counters() const noexcept {
         return async_ ? async_->counters : inline_counters_;
     }
-    thread_pool* current_pool() const noexcept {
-        return parallel_ ? parallel_->published.load(std::memory_order_acquire) : nullptr;
+    parallel_state* current_parallel() const noexcept {
+        return parallel_ && parallel_->ready.load(std::memory_order_acquire) ? parallel_.get() : nullptr;
     }
     // Single-thread mode uses plain loads/stores, sharing storage with MT counters.
     static std::uint64_t increment_local(std::atomic<std::uint64_t>& value) noexcept {
@@ -2008,8 +2356,10 @@ private:
     std::atomic<unsigned char> capture_mask_{0};
     const unsigned char allowed_metadata_;
     unsigned char required_metadata_ = 0;
+    const std::size_t pool_size_; // 0 => pool size follows the sink count
     const bool single_threaded_;
     std::atomic<bool> views_only_{true};
+    std::atomic<bool> inline_ok_{true};
     detail::compact_mutex sinks_mu_, shutdown_mu_;
     bool shutdown_done_ = false;
 

@@ -170,19 +170,20 @@ Behavior:
 
 `parallel_sinks` controls whether **sync-mode** logging fans out a single log event to multiple sinks in parallel.
 
-- When `cfg.async.enabled == false` and `cfg.parallel_sinks == true`, `logger::add_sink()` lazily creates an internal thread pool and each log event will enqueue one task per sink.
+- When `cfg.async.enabled == false` and `cfg.parallel_sinks == true`, chlog lazily starts an internal thread pool once a **second** sink makes fan-out real; each log event then enqueues one task per sink.
+- A single destination is written by the calling thread. With only one sink there is nothing to parallelize, and the pool would only add a hand-off; `sink_pool_size > 0` still forces the pool for one sink if the write must move off the caller.
 - When `cfg.async.enabled == true`, chlog intentionally keeps sink writes on the **single async worker thread** for best throughput and lower overhead; `parallel_sinks` does not change async behavior.
 
 `logger_config::sink_pool_size` controls the number of worker threads used for parallel sinks:
 
-- `0` (default): uses `sinks.size()` at the time the pool is created.
-- `> 0`: uses that fixed size.
+- `0` (default): one worker per sink at the time the pool starts (after the second `add_sink`).
+- `> 0`: uses that fixed size, and forces the pool even for a single sink.
 
 Trade-offs (important):
 
 - **Ordering**: with `parallel_sinks` enabled, strict ordering across sinks (and even within the same sink under contention) is not guaranteed.
-- **Backpressure**: at most `sink_queue_capacity` tasks wait in the pool (default 1024), plus active worker tasks. Producers block when full. Event strings are shared across the tasks for that event.
-- **Flush semantics**: `logger::flush()` waits for pending tasks before flushing sinks. A `flush_on_level` record is flushed by each sink's task after that record is written.
+- **Backpressure**: at most `sink_queue_capacity` tasks wait in the pool (default 1024), plus the tasks workers have drained and are writing. Producers block when full. Event strings are shared across the tasks for that event.
+- **Flush semantics**: `logger::flush()` waits until the queue is empty and no worker is still writing a drained batch, then flushes the sinks. A record submitted concurrently with the barrier may still be in flight; the barrier always covers everything accepted before the call. A `flush_on_level` record is flushed by each sink's task after that record is written.
 
 Recommendation:
 
@@ -268,8 +269,10 @@ public:
 ```
 
 Use `event.own()` to retain an independent `log_event`. Views work with synchronous,
-asynchronous and parallel dispatch. With `parallel_sinks = false`, synchronous
-dispatch can format directly into temporary storage when every sink uses views.
+asynchronous and parallel dispatch. Whenever the calling thread writes directly
+(`parallel_sinks = false`, or a `parallel_sinks = true` logger whose pool is idle
+or has only one destination), synchronous dispatch can format into temporary
+storage when every sink uses views.
 Async records continue to own their queued payloads. Existing `sink::log(log_event)`
 implementations and subclasses of built-in sinks keep their original callback path.
 The comparison counter sink uses event views, as does spdlog's native sink interface.

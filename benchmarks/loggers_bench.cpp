@@ -173,6 +173,46 @@ run_result bench_chlog_sync(bool single_threaded, std::uint64_t iters) {
   return r;
 }
 
+// `parallel_sinks` defaults to true, so this is the out-of-the-box configuration
+// of a synchronous logger and deserves its own cases. Each record is dispatched
+// once per sink, hence the per-record normalization of the processed count.
+// A single destination is written by the calling thread, so `sync_parallel1`
+// measures the auto-mode fallback rather than the pool.
+template <unsigned Sinks>
+run_result bench_chlog_parallel(std::uint64_t iters) {
+  std::atomic<std::uint64_t> processed{0};
+
+  chlog::logger_config cfg;
+  cfg.name = "chlog_parallel";
+  cfg.level = chlog::level::info;
+  cfg.single_threaded = false;
+  cfg.async.enabled = false;
+  cfg.parallel_sinks = true;
+  cfg.pattern = "{msg}";
+
+  auto lg = std::make_shared<chlog::logger>(cfg);
+  for (unsigned i = 0; i < Sinks; ++i) {
+    lg->add_sink(std::make_shared<chlog_counter_sink>(processed));
+  }
+
+  const auto t0 = clock_t::now();
+  for (std::uint64_t i = 0; i < iters; ++i) {
+    lg->info("v {}", i);
+  }
+  // Include draining, matching the async cases' timing boundary.
+  lg->shutdown();
+  const auto t1 = clock_t::now();
+
+  run_result r;
+  r.runner = "chlog";
+  r.bench_case = "sync_parallel" + std::to_string(Sinks);
+  r.calls = iters;
+  r.seconds = std::chrono::duration<double>(t1 - t0).count();
+  r.processed = processed.load(std::memory_order_relaxed) / Sinks;
+  r.dropped = 0;
+  return r;
+}
+
 run_result bench_chlog_filtered_out(std::uint64_t iters) {
   std::atomic<std::uint64_t> processed{0};
 
@@ -415,6 +455,9 @@ int main(int argc, char** argv) {
   print_result(bench_chlog_filtered_out(cfg.iters));
   print_result(bench_chlog_sync(true, cfg.iters));
   print_result(bench_chlog_sync(false, cfg.iters));
+  print_result(bench_chlog_parallel<1>(cfg.iters));
+  print_result(bench_chlog_parallel<2>(cfg.iters));
+  print_result(bench_chlog_parallel<4>(cfg.iters));
   print_result(bench_chlog_async_mt(cfg.iters));
   print_result(bench_chlog_async_mt(cfg.iters, 4));
   print_result(bench_chlog_sync<true>(true, cfg.iters));

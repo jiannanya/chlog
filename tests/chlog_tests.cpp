@@ -166,7 +166,7 @@ void formatting() {
         CHECK(captured->events.at(2).payload == "escaped {braces}");
         CHECK(captured->events.at(3).payload == "broken {");
         CHECK(captured->events.at(4).payload == "{literal}");
-        CHECK(viewed.stats().errors == 1 && viewed.stats().dequeued == 5);
+        CHECK(viewed.stats().errors == 1 && viewed.stats().enqueued == 5 && viewed.stats().dequeued == 5);
         // Adding a legacy sink changes dispatch without changing either API.
         auto legacy = std::make_shared<recording_sink>(); viewed.add_sink(legacy);
         viewed.info("mixed sinks"); viewed.shutdown();
@@ -470,6 +470,70 @@ void parallel_tests() {
     CHECK(one->flushes >= 3 && two->flushes >= 3);
     logger.shutdown();
 
+    // Auto mode: one destination is written by the caller; the pool engages
+    // when a second sink makes fan-out real.
+    {
+        auto auto_cfg = config();
+        auto_cfg.parallel_sinks = true;
+        auto_cfg.sink_pool_size = 0;
+        chlog::logger auto_logger(auto_cfg);
+        auto first = std::make_shared<counter_sink>();
+        auto_logger.add_sink(first);
+        for (int i = 0; i < 100; ++i) auto_logger.info("inline {}", i);
+        CHECK(auto_logger.stats().queue_size == 0);
+        auto second = std::make_shared<counter_sink>();
+        auto_logger.add_sink(second);
+        for (int i = 0; i < 100; ++i) auto_logger.info("pooled {}", i);
+        auto_logger.flush();
+        CHECK(first->count == 200 && second->count == 100);
+        CHECK(auto_logger.stats().enqueued == 200 && auto_logger.stats().dequeued == 200);
+        auto_logger.shutdown();
+    }
+    // An explicit pool size keeps even a single destination on the pool: the
+    // caller returns while the sink is still inside its callback.
+    {
+        auto forced_cfg = config();
+        forced_cfg.parallel_sinks = true;
+        forced_cfg.sink_pool_size = 1;
+        chlog::logger forced_logger(forced_cfg);
+        auto gated = std::make_shared<blocked_sink>();
+        forced_logger.add_sink(gated);
+        auto producer = std::async(std::launch::async, [&] { forced_logger.info("first"); });
+        gated->wait_entered();
+        CHECK(producer.wait_for(200ms) == std::future_status::ready);
+        gated->proceed.release();
+        forced_logger.flush();
+        CHECK(gated->count.load() == 1);
+        forced_logger.shutdown();
+    }
+    // A flush must wait for a record that is still being written even when
+    // newer records complete first. A barrier built only from a count of
+    // completed records would pass as soon as enough later records finish.
+    {
+        auto barrier_cfg = config();
+        barrier_cfg.parallel_sinks = true;
+        barrier_cfg.sink_pool_size = 4;
+        barrier_cfg.sink_queue_capacity = 32;
+        chlog::logger blocked_logger(barrier_cfg);
+        auto fast = std::make_shared<counter_sink>();
+        auto gated = std::make_shared<blocked_sink>();
+        blocked_logger.add_sink(gated);
+        blocked_logger.add_sink(fast);
+        for (int i = 0; i < 4; ++i) blocked_logger.info("early {}", i);
+        gated->wait_entered();
+        auto flushed = std::async(std::launch::async, [&] { blocked_logger.flush(); });
+        // Give the flush thread time to enter the barrier, then let newer
+        // records finish while the gated record is still in flight.
+        std::this_thread::sleep_for(50ms);
+        for (int i = 0; i < 16; ++i) blocked_logger.info("late {}", i);
+        std::this_thread::sleep_for(50ms);
+        CHECK(flushed.wait_for(0ms) == std::future_status::timeout);
+        gated->proceed.release();
+        CHECK(flushed.wait_for(5s) == std::future_status::ready);
+        CHECK(gated->count.load() == 20 && fast->count.load() == 20);
+        blocked_logger.shutdown();
+    }
+
     chlog::thread_pool pool(1, 1);
     std::binary_semaphore entered{0}, proceed{0};
     CHECK(pool.enqueue([&] { entered.release(); proceed.acquire(); }));
@@ -687,6 +751,8 @@ void concurrent_tests() {
             cfg.async.drop_when_full = false; cfg.async.batch_max = 1;
             chlog::logger logger(cfg);
             auto output = std::make_shared<counter_sink>(); logger.add_sink(output);
+            // The parallel pool engages for fan-out, so give it a second sink.
+            if (mode == 2) logger.add_sink(std::make_shared<counter_sink>());
             std::atomic<int> started{0};
             std::vector<std::thread> producers;
             for (int t = 0; t < 6; ++t) producers.emplace_back([&] {
