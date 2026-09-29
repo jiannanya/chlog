@@ -15,6 +15,7 @@
 #include <charconv>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,10 @@
 
 #ifdef _WIN32
     #include <share.h>
+#endif
+
+#if defined(__APPLE__)
+    #include <sys/time.h>
 #endif
 
 #if defined(CHLOG_USE_FMT)
@@ -110,6 +115,233 @@ inline constexpr bool plain_string_argument = sizeof...(Args) == 1 &&
     ((std::is_same_v<std::remove_cvref_t<Args>, std::string> ||
       std::is_same_v<std::remove_cvref_t<Args>, std::string_view>) && ...);
 
+// ---------------------- Restricted-grammar fast formatting ----------------------
+//
+// The formatting functions re-parse their format string on every call: the
+// compile-time check performed by format_string only validates the string, it
+// does not pre-compile it. For a record like "v {}" that parse and its generic
+// dispatch dominate the whole logging call, so the common shape - literal text
+// with bare "{}" replacement fields and no format specs - is recognized here and
+// executed directly.
+//
+// The subset is deliberately narrow, and everything else falls back to the
+// general formatter, so behaviour is unchanged:
+//   * a '{' must be immediately followed by '}' (no spec, no '{N}', no "{{"),
+//   * a '}' outside a field, and any escaped brace, end the fast path,
+//   * the number of fields must equal the number of arguments, so argument
+//     mismatches keep reporting exactly what the general formatter reports,
+//   * every argument type must have a representation that is provably identical
+//     to the default (empty) format spec: integers and floating-point values via
+//     std::to_chars (the shortest round-tripping decimal form the default spec
+//     is defined to produce), bool as true/false, char as itself, and the string
+//     types as their bytes.
+//
+// Types without such a guarantee (pointers, enums, custom formatters, types
+// without a to_chars overload) disable the whole call at compile time, so the
+// general formatter is used exactly once, and its exceptions still propagate.
+
+// True when std::to_chars can produce the default representation of T. This
+// excludes bool, char, and anything the implementation has no overload for (for
+// example an extended 128-bit integer).
+template <class T>
+inline constexpr bool to_chars_default = requires(char* first, const T& value) {
+    std::to_chars(first, first, value);
+};
+
+// The character-like integral types are excluded explicitly: their default
+// representation depends on the formatting context, and an implementation may
+// provide to_chars for them without the two agreeing. They do not occur in log
+// format strings, and declining them costs nothing.
+template <class T>
+inline constexpr bool character_like = std::is_same_v<T, wchar_t> || std::is_same_v<T, char8_t> ||
+    std::is_same_v<T, char16_t> || std::is_same_v<T, char32_t>;
+
+template <class T>
+inline constexpr bool bare_field_argument = [] {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (std::is_same_v<U, bool> || std::is_same_v<U, char>) return true;
+    else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view>) return true;
+    else if constexpr (std::is_array_v<U>)
+        return std::is_same_v<std::remove_cv_t<std::remove_extent_t<U>>, char>;
+    else if constexpr (std::is_pointer_v<U>)
+        return std::is_same_v<std::remove_cv_t<std::remove_pointer_t<U>>, char>;
+    else if constexpr (character_like<U>) return false;
+#if defined(CHLOG_USE_FMT)
+    // fmt's default floating-point format is not std::to_chars' general format:
+    // it switches to scientific notation in places where to_chars stays fixed
+    // ("-3.9837757e+08" against "-398377568" for a float). Only the standard
+    // formatter defines its empty spec as the shortest round-tripping to_chars
+    // form, so with fmt every floating-point argument keeps the general
+    // formatter. The equivalence test asserts this decline.
+    else if constexpr (std::is_floating_point_v<U>) return false;
+#else
+    else if constexpr (std::is_floating_point_v<U> && to_chars_default<U>) return true;
+#endif
+    else if constexpr (std::is_integral_v<U> && to_chars_default<U>) return true;
+    else return false;
+}();
+
+template <class... Args>
+inline constexpr bool bare_field_arguments = (bare_field_argument<Args> && ...);
+
+// One literal run of the format string. Fields sit between consecutive runs, so
+// n fields are described by n + 1 runs.
+struct bare_run {
+    std::uint32_t begin;
+    std::uint32_t size;
+};
+
+inline constexpr std::size_t bare_max_fields = 8;
+
+// True when the text contains no brace at all, in which case there is nothing to
+// substitute and the text itself is the payload. A single pass beats
+// string_view::find_first_of, which builds a 256-entry lookup table per call:
+// for the short format strings used in logging that setup costs more than
+// reading the text outright.
+inline bool has_no_braces(std::string_view text) noexcept {
+    for (const char c : text)
+        if (c == '{' || c == '}') return false;
+    return true;
+}
+
+// Returns the number of replacement fields, or -1 when the text uses anything
+// outside the subset. Nothing is written, so a rejected text leaves the output
+// untouched for the general formatter.
+inline int plan_bare_fields(std::string_view text, bare_run* runs, std::size_t max_runs) noexcept {
+    if (text.size() > 0xFFFFFFFFu) return -1;
+    std::size_t pos = 0, literal = 0, count = 0;
+    while (pos < text.size()) {
+        const char c = text[pos];
+        if (c == '{') {
+            if (pos + 1 >= text.size() || text[pos + 1] != '}') return -1;
+            if (count + 2 > max_runs) return -1;
+            runs[count].begin = static_cast<std::uint32_t>(literal);
+            runs[count].size = static_cast<std::uint32_t>(pos - literal);
+            ++count;
+            pos += 2;
+            literal = pos;
+        } else if (c == '}') {
+            return -1; // Escapes and stray braces keep the general formatter.
+        } else {
+            ++pos;
+        }
+    }
+    if (count + 1 > max_runs) return -1;
+    runs[count].begin = static_cast<std::uint32_t>(literal);
+    runs[count].size = static_cast<std::uint32_t>(text.size() - literal);
+    return static_cast<int>(count);
+}
+
+// Appends bytes with a member the output type actually provides. std::string
+// takes (pointer, size); fmt's memory buffer takes a pointer pair. Both also
+// provide push_back, which is all the fast path needs besides this.
+inline void buffer_append(std::string& out, const char* data, std::size_t size) { out.append(data, size); }
+#if defined(CHLOG_USE_FMT)
+inline void buffer_append(fmt::basic_memory_buffer<char, 250>& out, const char* data, std::size_t size) {
+    out.append(data, data + size);
+}
+#endif
+
+template <class Output>
+inline void append_literal(Output& out, const char* text, const bare_run& run) {
+    if (run.size) buffer_append(out, text + run.begin, run.size);
+}
+
+template <class T, class = void>
+struct reserve_tail_aware : std::false_type {};
+template <class T>
+struct reserve_tail_aware<T, std::void_t<decltype(std::declval<T&>().reserve_tail(std::size_t{})),
+                                         decltype(std::declval<T&>().commit_tail(std::size_t{}))>>
+    : std::true_type {};
+
+// True for an output that can hand out a writable tail. Numbers are then written
+// where they belong instead of into a scratch buffer and copied.
+template <class T>
+inline constexpr bool has_reserve_tail = reserve_tail_aware<T>::value;
+
+template <class Output, class T>
+inline void append_bare_value(Output& out, const T& value) {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (std::is_same_v<U, bool>) {
+        static constexpr char yes[] = "true", no[] = "false";
+        buffer_append(out, value ? yes : no, value ? 4u : 5u);
+    } else if constexpr (std::is_same_v<U, char>) {
+        out.push_back(value);
+    } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view>) {
+        if (!value.empty()) buffer_append(out, value.data(), value.size());
+    } else if constexpr (std::is_array_v<U> || std::is_pointer_v<U>) {
+        const auto* text = value;
+        const auto size = std::char_traits<char>::length(text);
+        if (size) buffer_append(out, text, size);
+    } else if constexpr (has_reserve_tail<Output>) {
+        // 64 bytes cover any value std::to_chars accepts here, including the
+        // longest shortest-round-trip floating-point form.
+        auto* digits = out.reserve_tail(64);
+        const auto result = std::to_chars(digits, digits + 64, value);
+        out.commit_tail(static_cast<std::size_t>(result.ptr - digits));
+    } else {
+        char digits[64];
+        const auto result = std::to_chars(digits, digits + sizeof(digits), value);
+        buffer_append(out, digits, static_cast<std::size_t>(result.ptr - digits));
+    }
+}
+
+// A null C string is undefined behaviour for the general formatter too, but fmt
+// prints "(null)" for it. Rejecting it here keeps that diagnostic reachable by
+// falling back instead of dereferencing the pointer.
+//
+// Non-finite floating point is rejected for a different reason: to_chars appends
+// the NaN payload ("nan(snan)", "-nan(ind)"), while the default format spec must
+// print just "nan" / "-nan", and the exact spelling is the implementation's. The
+// general formatter settles it, and infinity and NaN are rare enough that losing
+// the fast path for them costs nothing.
+template <class T>
+inline bool bare_argument_valid(const T& value) noexcept {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (std::is_pointer_v<U> &&
+                  std::is_same_v<std::remove_cv_t<std::remove_pointer_t<U>>, char>)
+        return value != nullptr;
+    else if constexpr (std::is_floating_point_v<U>)
+        return std::isfinite(value);
+    else return true;
+}
+
+template <class... Args>
+inline bool bare_arguments_valid(const Args&... args) noexcept {
+    return (bare_argument_valid(args) && ...);
+}
+
+// Emits the literal that precedes one field and then the field itself, so a
+// comma fold over the arguments walks the runs and the fields in lockstep.
+template <class Output, class T>
+inline void emit_bare_field(Output& out, const char* text, const bare_run* runs,
+                            std::size_t& run, const T& value) {
+    append_literal(out, text, runs[run]);
+    ++run;
+    append_bare_value(out, value);
+}
+
+// Emits a plan produced by plan_bare_fields() for arguments already checked with
+// bare_arguments_valid(). Declining and rendering are separate steps so a caller
+// can decide before it takes any per-record bookkeeping (a log_guard must be
+// entered exactly once per accepted record).
+template <class Output, class... Args>
+inline void emit_bare_fields(Output& out, const char* text, const bare_run* runs, const Args&... args) {
+    std::size_t run = 0;
+    (emit_bare_field(out, text, runs, run, args), ...);
+    append_literal(out, text, runs[run]);
+}
+
+template <class Output, class... Args>
+inline bool format_bare_fields(Output& out, std::string_view text, const Args&... args) {
+    bare_run runs[bare_max_fields + 1];
+    const auto fields = plan_bare_fields(text, runs, bare_max_fields + 1);
+    if (fields != static_cast<int>(sizeof...(Args))) return false;
+    if (!bare_arguments_valid(args...)) return false;
+    emit_bare_fields(out, text.data(), runs, args...);
+    return true;
+}
+
 template <class... Args>
 inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
     if constexpr (plain_string_argument<Args...>) {
@@ -119,7 +351,11 @@ inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
     }
     if constexpr (sizeof...(Args) == 0) {
         const auto text = format_view<>(fmt);
-        if (text.find_first_of("{}") == std::string_view::npos) return std::string(text);
+        if (has_no_braces(text)) return std::string(text);
+    }
+    if constexpr (bare_field_arguments<Args...>) {
+        std::string out;
+        if (format_bare_fields(out, format_view<Args...>(fmt), args...)) return out;
     }
 #if defined(CHLOG_USE_FMT)
     return fmt::format(fmt, std::forward<Args>(args)...);
@@ -134,7 +370,11 @@ inline std::string vformat_payload(std::string_view fmt, Args&&... args) {
         if (fmt == "{}") return std::string(std::string_view(args)...);
     }
     if constexpr (sizeof...(Args) == 0) {
-        if (fmt.find_first_of("{}") == std::string_view::npos) return std::string(fmt);
+        if (has_no_braces(fmt)) return std::string(fmt);
+    }
+    if constexpr (bare_field_arguments<Args...>) {
+        std::string out;
+        if (format_bare_fields(out, fmt, args...)) return out;
     }
 #if defined(CHLOG_USE_FMT)
     return fmt::vformat(fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
@@ -309,20 +549,163 @@ inline std::tm localtime_safe(std::time_t t) noexcept {
 
 namespace detail {
 
-// A record-local buffer: short output stays on the stack, and unusually long
-// records release their storage when the callback returns. No shared/TLS state.
+// Copies a short run inline instead of calling the C library. Record rendering is
+// a long series of small copies (literal runs, field separators, digits), and on
+// a dynamically linked target the call plus its lazy-binding stub costs more than
+// the handful of bytes it moves. Longer runs are still handed to memcpy.
+inline void copy_bytes(char* destination, const char* source, std::size_t count) noexcept {
+    if (count <= 16) {
+        for (std::size_t i = 0; i < count; ++i) destination[i] = source[i];
+        return;
+    }
+    std::memcpy(destination, source, count);
+}
+
+// Storage blocks for records that outgrow the inline capacity of text_buffer.
+//
+// Without this, every record longer than the inline area costs one allocation
+// and one free, even when the same thread immediately logs another record of
+// the same shape - the buffer itself is a local, so its block died with it.
+// Blocks up to block_retain_limit are therefore returned to a short per-thread
+// free list instead of being deleted, and grow() takes one from that list
+// before asking the allocator.
+//
+// Ownership stays exclusive: the list only ever holds blocks that no live
+// buffer points at. A sink rendering while an enclosing record buffer is still
+// alive (dispatch happens before the producer's buffer is destroyed) simply
+// takes the second block, so nothing is ever shared and a sink that logs from
+// inside its own log() cannot alias either. At most two blocks are kept and
+// anything larger than block_retain_limit is freed at once, so a thread never
+// pins more than 2 * block_retain_limit bytes no matter what it logged; the
+// list is destroyed when the thread ends and releases everything it still holds.
+inline constexpr std::size_t block_retain_limit = 8192;
+
+class block_list;
+
+// Whether this thread's list is still alive. A thread_local with a trivial
+// destructor has a lifetime that lasts until the thread ends, with no
+// destruction order to worry about, so this flag can still be read after the
+// list's own destructor has run. That happens when a thread_local object that
+// was created before the list logs a long record on its way out.
+inline bool& local_blocks_alive() noexcept;
+
+class block_list {
+public:
+    block_list() = default;
+    ~block_list() noexcept {
+        clear();
+        local_blocks_alive() = false;
+    }
+    block_list(const block_list&) = delete;
+    block_list& operator=(const block_list&) = delete;
+
+    // Smallest retained block that can hold `need` bytes; nullptr when none
+    // fits. Best fit keeps the larger blocks available for the longer record.
+    char* take(std::size_t need, std::size_t& size) noexcept {
+        std::size_t best = count_;
+        for (std::size_t i = 0; i < count_; ++i)
+            if (sizes_[i] >= need && (best == count_ || sizes_[i] < sizes_[best])) best = i;
+        if (best == count_) return nullptr;
+        char* block = blocks_[best];
+        size = sizes_[best];
+        --count_;
+        blocks_[best] = blocks_[count_];
+        sizes_[best] = sizes_[count_];
+        return block;
+    }
+    void put(char* block, std::size_t size) noexcept {
+        // Outliers are released immediately: a one-off megabyte record must not
+        // become this thread's permanent footprint.
+        if (size > block_retain_limit) {
+            ::operator delete[](block);
+            return;
+        }
+        if (count_ == slots) {
+            // Full. Keep the larger of the smallest resident block and the
+            // incoming one instead of always dropping the newcomer: a record
+            // whose length drifts by a byte (an extra digit in {seq}) would
+            // otherwise leave two blocks that are each one byte too small and
+            // evict every block that could have served the next record.
+            std::size_t victim = 0;
+            for (std::size_t i = 1; i < slots; ++i)
+                if (sizes_[i] < sizes_[victim]) victim = i;
+            if (sizes_[victim] >= size) {
+                ::operator delete[](block);
+                return;
+            }
+            ::operator delete[](blocks_[victim]);
+            blocks_[victim] = block;
+            sizes_[victim] = size;
+            return;
+        }
+        blocks_[count_] = block;
+        sizes_[count_] = size;
+        ++count_;
+    }
+private:
+    void clear() noexcept {
+        for (std::size_t i = 0; i < count_; ++i) ::operator delete[](blocks_[i]);
+        count_ = 0;
+    }
+    static constexpr std::size_t slots = 2;
+    char* blocks_[slots]{};
+    std::size_t sizes_[slots]{};
+    std::size_t count_ = 0;
+};
+
+inline block_list& local_blocks() noexcept {
+    static thread_local block_list list;
+    return list;
+}
+
+inline bool& local_blocks_alive() noexcept {
+    static thread_local bool alive = true;
+    return alive;
+}
+
+// Returning a block to the thread-local list from the destructor.
+//
+// This is deliberately not inlined. text_buffer is destroyed once per record,
+// including every record that stayed inside the inline area and never touched
+// the free list, so the destructor must stay small enough that callers inline
+// it down to the heap_ test; pulling the list bookkeeping (and the thread-local
+// guard that reaches it) into the destructor body instead costs an out-of-line
+// call per record.
+//
+// The alive test is what keeps a record logged from a thread_local destructor
+// safe: if that destructor outlives the list, the block is released directly
+// instead of being handed to a destroyed object.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+inline void recycle_block(char* block, std::size_t size) noexcept {
+    if (local_blocks_alive()) local_blocks().put(block, size);
+    else ::operator delete[](block);
+}
+
+// A record-local buffer: short output stays on the stack. A record that
+// outgrows the inline area takes its block from local_blocks() on the way up
+// and hands it back on the way out, so only the first long record of a given
+// shape on a thread touches the allocator.
 class text_buffer {
 public:
     using value_type = char;
     text_buffer() = default;
     text_buffer(const text_buffer&) = delete;
     text_buffer& operator=(const text_buffer&) = delete;
+    ~text_buffer() noexcept {
+        // Guarded by the null test first: a record that stayed inline never
+        // reaches the thread-local, which is the overwhelmingly common case.
+        if (heap_) recycle_block(heap_.release(), capacity_);
+    }
     const char* data() const noexcept { return data_; }
     std::size_t size() const noexcept { return size_; }
     std::string_view view() const noexcept { return {data_, size_}; }
     void append(const char* text, std::size_t count) {
         if (count > capacity_ - size_) grow(count);
-        if (count) std::memcpy(data_ + size_, text, count);
+        if (count) copy_bytes(data_ + size_, text, count);
         size_ += count;
     }
     void append(std::string_view text) { append(text.data(), text.size()); }
@@ -331,6 +714,14 @@ public:
         if (size_ == capacity_) grow(1);
         data_[size_++] = c;
     }
+    // Room for a producer that writes the bytes itself, for example std::to_chars
+    // for a number: it skips both an intermediate buffer and the copy of it. Only
+    // the bytes passed to commit_tail() are ever part of the value.
+    char* reserve_tail(std::size_t count) {
+        if (count > capacity_ - size_) grow(count);
+        return data_ + size_;
+    }
+    void commit_tail(std::size_t count) noexcept { size_ += count; }
 private:
     void grow(std::size_t extra) {
         constexpr auto limit = static_cast<std::size_t>((std::numeric_limits<std::ptrdiff_t>::max)());
@@ -339,8 +730,24 @@ private:
         // Leave room for the newline and small suffixes after a large payload.
         const auto next = (std::max)(required + (std::min)(std::size_t{64}, limit - required),
                                     capacity_ + (std::min)(capacity_ / 2, limit - capacity_));
+        std::size_t reused = 0;
+        // Reuse asks only for the bytes actually needed, not for the growth
+        // headroom above: a resident block that fits the record exactly is
+        // still reusable, and rejecting it would allocate a fresh block (and
+        // retain the old one) every time a record grows by a byte - an extra
+        // digit in {seq} is enough. The headroom matters only when allocating.
+        // A grow from a thread_local destructor can run after the list is gone,
+        // in which case this allocates as it did before the free list existed.
+        char* block = local_blocks_alive() ? local_blocks().take(required, reused) : nullptr;
+        if (block) {
+            if (size_) copy_bytes(block, data_, size_);
+            heap_.reset(block);
+            data_ = block;
+            capacity_ = reused;
+            return;
+        }
         auto storage = std::unique_ptr<char[]>(new char[next]);
-        std::memcpy(storage.get(), data_, size_);
+        if (size_) copy_bytes(storage.get(), data_, size_);
         heap_ = std::move(storage);
         data_ = heap_.get();
         capacity_ = next;
@@ -350,6 +757,13 @@ private:
     char* data_ = inline_;
     std::size_t size_ = 0, capacity_ = sizeof(inline_);
 };
+
+// The rendering helpers below are declared with the fast-formatting group much
+// earlier in this namespace, but this overload can only be written once
+// text_buffer is complete. Both are found by argument-dependent lookup at the
+// point where the helper templates are instantiated, so the split is invisible
+// to callers.
+inline void buffer_append(text_buffer& out, const char* data, std::size_t size) { out.append(data, size); }
 
 // The owning sink serializes access, or explicitly operates in single-threaded
 // mode. Accumulate short records before entering the CRT; large writes bypass
@@ -470,6 +884,26 @@ struct time_parts {
     bool valid = false;
     std::array<char, 20> timestamp{};
 };
+
+// Wall-clock sample used for record timestamps.
+//
+// std::chrono::system_clock is specified to read CLOCK_REALTIME and, on this
+// platform, has a 1/1_000_000 s period backed by gettimeofday(). Calling
+// gettimeofday() directly therefore yields the exact same time_point value
+// while skipping the extra libc chrono/clock_gettime wrapper hop, which showed
+// up as ~75% of the compiled-pattern hot path. Everywhere else we keep using
+// system_clock::now() so the observable timestamp source never changes.
+inline std::chrono::system_clock::time_point wall_now() noexcept {
+#if defined(__APPLE__)
+    ::timeval tv{};
+    ::gettimeofday(&tv, nullptr);
+    return std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::seconds{tv.tv_sec} + std::chrono::microseconds{tv.tv_usec}));
+#else
+    return std::chrono::system_clock::now();
+#endif
+}
 
 inline const time_parts& cached_time(std::chrono::system_clock::time_point tp) {
     thread_local time_parts cache;
@@ -1982,10 +2416,13 @@ private:
                 if (text == "{}") { submit_view(lv, loc, std::string_view(args)...); return; }
             }
             if constexpr (sizeof...(Args) == 0) {
-                if (text.find_first_of("{}") == std::string_view::npos) {
+                if (detail::has_no_braces(text)) {
                     submit_view(lv, loc, text);
                     return;
                 }
+            }
+            if constexpr (detail::bare_field_arguments<Args...>) {
+                if (submit_bare(lv, loc, text, args...)) return;
             }
             submit_formatted_view(lv, loc, text, [&](auto& buffer) {
 #if defined(CHLOG_USE_FMT)
@@ -2006,7 +2443,10 @@ private:
                 if (fmt == "{}") { submit_view(lv, loc, std::string_view(args)...); return; }
             }
             if constexpr (sizeof...(Args) == 0) {
-                if (fmt.find_first_of("{}") == std::string_view::npos) { submit_view(lv, loc, fmt); return; }
+                if (detail::has_no_braces(fmt)) { submit_view(lv, loc, fmt); return; }
+            }
+            if constexpr (detail::bare_field_arguments<Args...>) {
+                if (submit_bare(lv, loc, fmt, args...)) return;
             }
             submit_formatted_view(lv, loc, fmt, [&](auto& buffer) {
 #if defined(CHLOG_USE_FMT)
@@ -2018,6 +2458,33 @@ private:
             return;
         }
         submit(lv, loc, [&] { return detail::vformat_payload(fmt, std::forward<Args>(args)...); }, fmt);
+    }
+    // Renders the accepted subset straight into a stack buffer: no owning string
+    // and no library formatting call. Returns false when the text is outside the
+    // subset, having written nothing and taken no per-record bookkeeping, so the
+    // caller can hand the record to the general formatter instead.
+    template <class... Args>
+    bool submit_bare(level lv, const std::source_location& loc, std::string_view text, const Args&... args) {
+        detail::bare_run runs[detail::bare_max_fields + 1];
+        const auto fields = detail::plan_bare_fields(text, runs, detail::bare_max_fields + 1);
+        if (fields != static_cast<int>(sizeof...(Args))) return false;
+        if (!detail::bare_arguments_valid(args...)) return false;
+        log_guard active(*this);
+        if (!active) return true;
+        detail::text_buffer buffer;
+        bool rendered = false;
+        try {
+            detail::emit_bare_fields(buffer, text.data(), runs, args...);
+            rendered = true;
+        } catch (...) {
+            // Same contract as a failing formatter: count the error and deliver
+            // the unformatted text.
+            error();
+        }
+        // One dispatch site only: this function is inlined into the hot logging
+        // entry point, and the handler must not duplicate that body.
+        dispatch_view(lv, loc, rendered ? buffer.view() : text, active.sequence);
+        return true;
     }
     // True when the record can go straight from the caller into view sinks:
     // no queue and no running sink pool. A configured-but-idle pool does not
@@ -2050,7 +2517,7 @@ private:
     void dispatch_view(level lv, const std::source_location& loc, std::string_view message, std::uint64_t sequence) {
         log_event_view e;
         const auto capture = capture_mask_.load(std::memory_order_acquire);
-        if (capture & sink::timestamp) e.ts = std::chrono::system_clock::now();
+        if (capture & sink::timestamp) e.ts = detail::wall_now();
         if (capture & sink::thread_id) e.tid = std::this_thread::get_id();
         if (capture & sink::logger_name) e.name = name_;
         if (capture & sink::source_location) e.loc = loc;
@@ -2071,7 +2538,7 @@ private:
         if (!active) return;
         log_event e;
         const auto capture = capture_mask_.load(std::memory_order_acquire);
-        if (capture & sink::timestamp) e.ts = std::chrono::system_clock::now();
+        if (capture & sink::timestamp) e.ts = detail::wall_now();
         if (capture & sink::thread_id) e.tid = std::this_thread::get_id();
         if ((capture & sink::logger_name) && !queue_) e.name = name_;
         if (capture & sink::source_location) e.loc = loc;

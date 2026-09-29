@@ -1,6 +1,6 @@
 add_executable(chlog_tests chlog_tests.cpp)
 target_link_libraries(chlog_tests PRIVATE chlog::chlog)
-foreach(suite IN ITEMS formatting queue async parallel files concurrent configuration registration)
+foreach(suite IN ITEMS formatting fastformat queue async parallel files concurrent configuration registration reuse)
   add_test(NAME chlog_${suite} COMMAND chlog_tests ${suite})
   set_tests_properties(chlog_${suite} PROPERTIES TIMEOUT 60)
 endforeach()

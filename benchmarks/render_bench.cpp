@@ -94,6 +94,12 @@ int main(int argc, char** argv) {
                   << " allocations=" << allocation_count.load() << " bytes=" << output.bytes << '\n';
         for (auto payload : {128u, 1024u}) {
             e.payload.assign(payload, 'x');
+            // Warm-up outside the window: the first long record allocates (and
+            // may grow in several steps for the json renderer), every later one
+            // reuses the retained block. The counters below show the steady
+            // state, so the contract is now exactly zero allocations per record.
+            e.seq = 0;
+            output.buffered(e);
             allocation_count = 0;
             allocated_bytes = 0;
             track_allocations = true;
@@ -101,12 +107,18 @@ int main(int argc, char** argv) {
             for (std::uint64_t i = 0; i < iterations; ++i) { e.seq = i; output.buffered(e); }
             const auto buffered_end = std::chrono::steady_clock::now();
             track_allocations = false;
-            const auto expected = payload == 128 ? 0 : iterations;
-            if (allocation_count != expected) return 1;
+            // Rendering a record longer than the inline area no longer costs one
+            // allocation per call: the block is retained per thread, so the
+            // steady state allocates nothing at all, for every payload size and
+            // pattern. The check still fails a return to per-call allocation,
+            // which is what the previous rounds asserted. Print before checking
+            // so a build with the old behaviour still reports its numbers.
+            const bool within_budget = allocation_count == 0 && allocated_bytes == 0;
             std::cout << "BUFFER pattern=" << pattern << " payload=" << payload << " iterations=" << iterations
                       << " seconds=" << std::chrono::duration<double>(buffered_end - buffered_start).count()
                       << " allocations=" << allocation_count.load() << " allocated_bytes=" << allocated_bytes.load()
                       << " bytes=" << output.bytes << '\n';
+            if (!within_budget) return 1;
         }
     }
     chlog::logger_config cfg;

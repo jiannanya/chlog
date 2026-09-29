@@ -446,9 +446,11 @@ python ./tools/logbench_output.py --build-dir build-ninja-clang --out docs/logbe
 Direct instances of the built-in sinks consume borrowed records when RTTI is
 available. Subclasses keep their owning `log()` callback, and builds without RTTI
 use the owning path. Construct sinks fully before registering them with a logger.
-Formatted sink output uses a local 512-byte buffer, with temporary heap storage for
-long records. Message-only rotating-file output writes the payload into the file
-buffer directly. Temporary rendering storage is released after the callback.
+Formatted sink output uses a local 512-byte buffer. Longer records take heap storage
+that is retained per thread (up to two blocks of 8 KiB) and reused by that thread's
+next long record, so a run of long records stops allocating after the first one.
+Nothing is shared between threads, larger blocks are released immediately, and the
+per-thread storage is freed when the thread ends.
 Custom sinks can append rendered output to a caller-owned string with
 `render_to(event, output)`; both `log_event` and `log_event_view` are supported.
 Use separate storage for the event fields and the output buffer.

@@ -1,6 +1,8 @@
 #include <chlog/chlog.hpp>
 
+#include <bit>
 #include <future>
+#include <limits>
 #include <set>
 
 using namespace std::chrono_literals;
@@ -939,11 +941,404 @@ void registration_tests() {
     }
 }
 
+// The restricted-grammar fast path must be byte-identical to the general
+// formatter for every shape it claims to handle, and must decline everything
+// else so the general formatter (including its diagnostics) stays reachable.
+// The reference goes through the general formatter, so the two are compared on
+// equal terms regardless of the backend.
+template <class... Args>
+std::string reference_format(std::string_view fmt, Args&... args) {
+#if defined(CHLOG_USE_FMT)
+    return fmt::vformat(fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
+#else
+    return std::vformat(fmt, std::make_format_args(args...));
+#endif
+}
+
+// By-value convenience form: it materialises lvalues for the general formatter
+// and decays arrays the way an argument to a variadic format call does.
+template <class... Args>
+std::string reference_format_value(std::string_view fmt, Args... args) {
+    return reference_format(fmt, args...);
+}
+
+void fastformat_tests() {
+    // Types and shapes the fast path accepts.
+    static_assert(chlog::detail::bare_field_arguments<int, unsigned, long long>);
+    static_assert(chlog::detail::bare_field_arguments<bool, char>);
+    static_assert(chlog::detail::bare_field_arguments<std::string, std::string_view, const char*>);
+    static_assert(chlog::detail::bare_field_arguments<const char (&)[4], char (&)[4]>);
+    // Types it must decline: none has a representation that is provably the
+    // default format spec, so those calls fall back to the general formatter.
+    static_assert(!chlog::detail::bare_field_arguments<void*>);
+    static_assert(!chlog::detail::bare_field_arguments<int*>);
+    static_assert(!chlog::detail::bare_field_arguments<std::vector<int>>);
+    static_assert(!chlog::detail::bare_field_arguments<custom_value>);
+    static_assert(!chlog::detail::bare_field_arguments<wchar_t>);
+    static_assert(!chlog::detail::bare_field_arguments<char16_t>);
+    static_assert(!chlog::detail::bare_field_arguments<int, void*>);
+
+    // A failure here must name the text, otherwise the reason is invisible.
+    // `compare` requires the fast path to take the call; `compare_or_decline`
+    // also accepts a decline, but still checks the bytes whenever it was taken.
+    const auto compare_impl = [](std::string_view text, auto&&... args) {
+        std::string fast;
+        if (!chlog::detail::format_bare_fields(fast, text, args...)) return false;
+        const auto expected = reference_format_value(text, args...);
+        if (fast != expected)
+            throw std::runtime_error("fast path mismatch for [" + std::string(text) + "]: got [" + fast +
+                                     "] want [" + expected + "]");
+        return true;
+    };
+    const auto compare = [&](std::string_view text, auto&&... args) {
+        if (!compare_impl(text, args...))
+            throw std::runtime_error("fast path declined a supported text: [" + std::string(text) + "]");
+    };
+    [[maybe_unused]] const auto compare_or_decline = [&](std::string_view text, auto&&... args) {
+        return compare_impl(text, args...);
+    };
+    // A declined text must be reported as declined and must not write anything,
+    // because the caller then runs the general formatter into the same buffer.
+    const auto declined = [](std::string_view text, auto&&... args) {
+        std::string out = "untouched";
+        CHECK(!chlog::detail::format_bare_fields(out, text, args...));
+        CHECK(out == "untouched");
+    };
+
+    // Literals only, and every placement of a field relative to the literal runs.
+    compare("");
+    compare("no fields at all");
+    compare("{}", 7);
+    compare("{}", -7);
+    compare("v {}", 12345u);
+    compare("{}:", std::string("x"));
+    compare("a{}b", 1);
+    compare("{} {} {}", 1, 2u, 3ll);
+    compare("a{}b{}c{}d", 1, 2, 3);
+    compare("  {}  {}  ", 'x', true);
+    compare("[{}|{}]", std::string_view("s"), std::string("t"));
+
+    // Integers across the full range, both signs.
+    for (auto v : {0, 1, 9, 10, 42, 99, 100, 999, 1000, 12345, 2147483647, -1, -9, -100, -2147483647})
+        compare("{}", v);
+    compare("{}", (std::numeric_limits<int>::min)());
+    for (auto v : {0u, 1u, 9u, 4294967295u}) compare("{}", v);
+    for (auto v : {0ull, 1ull, 18446744073709551615ull}) compare("{}", v);
+    for (auto v : {(short)-32768, (short)32767}) compare("{}", v);
+    for (auto v : {(signed char)-128, (signed char)127}) compare("{}", v);
+    compare("{}", static_cast<unsigned char>(255));
+    compare("{}", 0x7FFFFFFFFFFFFFFFll);
+    compare("{}", (std::numeric_limits<long long>::min)());
+
+    // Characters, booleans, and the fixed representations they must produce.
+    for (int c = 1; c < 128; ++c) compare("{}", static_cast<char>(c));
+    compare("{}", char{0});
+    compare("{} {} {}", true, false, true);
+
+    // Strings and C strings, including embedded NUL through the string types.
+    compare("{}", std::string());
+    compare("{}", std::string_view());
+    compare("{}", std::string("embedded\0nul", 12));
+    compare("{}", std::string_view("embedded\0nul", 12));
+    compare("{}", static_cast<const char*>("a c string"));
+    char mutable_array[] = "mutable";
+    compare("x{}y", mutable_array);
+    compare("{}", std::string_view("padding"));
+
+    // Floating point. The standard formatter's empty spec is defined as the
+    // shortest round-tripping std::to_chars form, so every finite value must
+    // match it byte for byte. fmt's default floating-point format is not that
+    // form (it switches to scientific notation where to_chars stays fixed), so
+    // with fmt floating point is declined entirely and the general formatter
+    // decides; the decline is asserted instead.
+#if defined(CHLOG_USE_FMT)
+    static_assert(!chlog::detail::bare_field_arguments<double>);
+    static_assert(!chlog::detail::bare_field_arguments<float>);
+    static_assert(!chlog::detail::bare_field_arguments<long double>);
+    static_assert(!chlog::detail::bare_field_arguments<int, double>);
+    // The policy is applied at the call site, so the owning formatter must still
+    // produce fmt's own default spelling for a floating-point argument.
+    CHECK(chlog::detail::format_payload("{}", 1.5) == reference_format_value("{}", 1.5));
+    CHECK(chlog::detail::format_payload("{}", -398377568.0f) ==
+          reference_format_value("{}", -398377568.0f));
+    CHECK(chlog::detail::format_payload("{}", 1e300) == reference_format_value("{}", 1e300));
+    CHECK(chlog::detail::format_payload("d {}", 3.25) == reference_format_value("d {}", 3.25));
+#else
+    static_assert(chlog::detail::bare_field_arguments<double, float>);
+    for (auto v : {0.0, -0.0, 1.0, -1.0, 0.5, 3.141592653589793, 1e-300, 1e300, 1.7976931348623157e308,
+                   2.2250738585072014e-308, 4.9e-324, 1.0 / 3.0, 123456789.123456789})
+        compare("{}", v);
+    for (auto v : {0.0f, -0.0f, 1.0f, 0.1f, 3.1415927f, 1e38f, 1.17549435e-38f, 1.4e-45f,
+                   -398377568.0f, 3.98377568e8f})
+        compare("{}", v);
+    declined("{}", std::numeric_limits<double>::infinity());
+    declined("{}", -std::numeric_limits<double>::infinity());
+    declined("{}", std::numeric_limits<double>::quiet_NaN());
+    declined("{}", -std::numeric_limits<double>::quiet_NaN());
+    declined("{}", std::numeric_limits<float>::infinity());
+    declined("{}", std::numeric_limits<float>::quiet_NaN());
+    // A deterministic bit-pattern sweep: thousands of doubles and floats, most
+    // of them finite, so the equivalence check itself stays well exercised.
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    std::size_t accepted = 0;
+    for (int i = 0; i < 40000; ++i) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if (i % 2) accepted += compare_or_decline("{}", std::bit_cast<double>(state));
+        else accepted += compare_or_decline("{}", std::bit_cast<float>(static_cast<std::uint32_t>(state)));
+    }
+    CHECK(accepted > 39000); // the sweep must actually reach the fast path
+#endif
+
+    // Shapes the fast path must decline, so the general formatter keeps running
+    // and the surrounding error handling is unchanged.
+    declined("{} {:04}", 42);   // format spec
+    declined("{:>9}", 1);       // alignment spec
+    declined("{0} {0}", 1);     // positional index
+    declined("a{{b}}");         // escaped braces
+    declined("a}}b");
+    declined("{");
+    declined("}");
+    declined("{} {}", 1);       // fewer arguments than fields
+    declined("{}", 1, 2);       // more arguments than fields
+    declined("", 1);
+    declined("{} {} {} {} {} {} {} {} {}", 1, 2, 3, 4, 5, 6, 7, 8, 9); // beyond the run budget
+
+    // A null C string is rejected rather than dereferenced, so the general
+    // formatter still decides what it reports.
+    const char* null_string = nullptr;
+    declined("{}", null_string);
+
+    // The owning formatter and the runtime-format overload use the same fast
+    // path, and it must agree with the general formatter through the public API.
+    CHECK(chlog::detail::format_payload("v {}", 12345u) == reference_format_value("v {}", 12345u));
+    CHECK(chlog::detail::vformat_payload(std::string_view("v {}"), 12345u) ==
+          reference_format_value("v {}", 12345u));
+    CHECK(chlog::detail::format_payload("plain literal") == reference_format_value("plain literal"));
+    CHECK(chlog::detail::format_payload("spec {:04}", 7) == reference_format_value("spec {:04}", 7));
+    CHECK(chlog::detail::format_payload("{}", 3.5) == reference_format_value("{}", 3.5));
+
+    // Same bytes whether the record is written inline into a view sink or owns
+    // its payload, for every destination mode.
+    for (int mode = 0; mode < 4; ++mode) {
+        auto cfg = config();
+        cfg.single_threaded = mode == 0;
+        cfg.async.enabled = mode == 2;
+        cfg.async.drop_when_full = false;
+        cfg.parallel_sinks = mode == 3;
+        chlog::logger logger(cfg);
+        auto legacy = std::make_shared<recording_sink>();
+        auto viewed = std::make_shared<recording_view_sink>();
+        logger.add_sink(legacy);
+        logger.add_sink(viewed);
+        std::string runtime_text = "runtime {} {}";
+        logger.info("plain {}", 42);
+        logger.info("two {} {}", std::string("a"), 7u);
+        logger.info("double {}", 1.5);
+        logger.info(runtime_text, 1, std::string("b"));
+        logger.info("{}", true);
+        logger.flush();
+        const std::array<std::string, 5> expected = {
+            "plain 42", "two a 7", "double 1.5", "runtime 1 b", "true"};
+        CHECK(legacy->lines.size() == expected.size());
+        CHECK(viewed->events.size() == expected.size());
+        std::multiset<std::string> observed_legacy(legacy->lines.begin(), legacy->lines.end());
+        std::multiset<std::string> observed_viewed;
+        for (const auto& event : viewed->events) observed_viewed.insert(event.payload);
+        const std::multiset<std::string> wanted(expected.begin(), expected.end());
+        CHECK(observed_legacy == wanted);
+        CHECK(observed_viewed == wanted);
+        // Only the parallel pool may complete records out of order, because its
+        // workers drain batches independently. Every other mode is ordered.
+        if (mode != 3) {
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                CHECK(legacy->lines.at(i) == expected[i]);
+                CHECK(viewed->events.at(i).payload == expected[i]);
+            }
+        }
+        CHECK(logger.stats().errors == 0);
+        logger.shutdown();
+    }
+
+    // Argument mismatches still surface as formatting errors, and the record
+    // falls back to the unformatted text exactly as before. A compile-time
+    // format string is already checked against its arguments, so this needs the
+    // runtime overload, where the fast path's count check is what keeps the
+    // call on the general formatter.
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<recording_sink>();
+        logger.add_sink(output);
+        std::string missing_argument = "a {} b {}";
+        logger.info(missing_argument, 1);
+        logger.shutdown();
+        CHECK(output->lines.at(0) == "a {} b {}");
+        CHECK(logger.stats().errors == 1);
+    }
+    // A format spec outside the accepted grammar still formats correctly.
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<recording_sink>();
+        logger.add_sink(output);
+        logger.info("{:04}", 1);
+        logger.shutdown();
+        CHECK(output->lines.at(0) == "0001");
+        CHECK(logger.stats().errors == 0);
+    }
+}
+
+// Records longer than the inline area take their heap block from a per-thread
+// free list and hand it back when the record is done. These tests pin down that
+// the recycling is invisible: every record must still carry exactly its own
+// bytes whatever shape the previous record had, two buffers alive at once (a
+// sink that logs) must not alias, and the list must not outlive its thread.
+void reuse_tests() {
+    const auto filled = [](std::size_t size, char fill) { return std::string(size, fill); };
+
+    // Sink-side rendering: every consume() call renders through its own buffer.
+    // The sizes cross the inline boundary (512) and the retention limit (8192).
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<recording_sink>();
+        logger.add_sink(output);
+        const std::size_t sizes[] = {700, 700, 700, 1500, 3000, 700, 400, 8000, 8300, 700, 900, 900};
+        for (std::size_t i = 0; i < std::size(sizes); ++i)
+            logger.info("{}", std::to_string(i) + filled(sizes[i], 'a' + static_cast<char>(i % 26)));
+        logger.shutdown();
+        CHECK(output->lines.size() == std::size(sizes));
+        for (std::size_t i = 0; i < std::size(sizes); ++i)
+            CHECK(output->lines.at(i) == std::to_string(i) + filled(sizes[i], 'a' + static_cast<char>(i % 26)));
+    }
+    // A pattern with a literal prefix forces the grow to copy the bytes written
+    // before the current append. That happens in the sink's buffer when the sink
+    // renders the record, and in the logger's own buffer when the format string
+    // carries the prefix on the view path.
+    {
+        auto cfg = config();
+        cfg.pattern = "L{msg}R";
+        chlog::logger logger(cfg);
+        auto owning = std::make_shared<recording_sink>();
+        logger.add_sink(owning);
+        for (int i = 0; i < 6; ++i) logger.info("{}", filled(static_cast<std::size_t>(400 + i * 900), 'x'));
+        logger.shutdown();
+        for (int i = 0; i < 6; ++i)
+            CHECK(owning->lines.at(static_cast<std::size_t>(i)) ==
+                  "L" + filled(static_cast<std::size_t>(400 + i * 900), 'x') + "R");
+    }
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto viewing = std::make_shared<recording_view_sink>();
+        logger.add_sink(viewing);
+        for (int i = 0; i < 6; ++i) logger.info("v {}", filled(static_cast<std::size_t>(400 + i * 900), 'v'));
+        logger.shutdown();
+        for (int i = 0; i < 6; ++i)
+            CHECK(viewing->events.at(static_cast<std::size_t>(i)).payload ==
+                  "v " + filled(static_cast<std::size_t>(400 + i * 900), 'v'));
+    }
+    // Two loggers on one thread: while an outer record is still being rendered,
+    // the sink logs to a second logger, which needs a second block. Both records
+    // must be intact afterwards, whatever the free list held at that point.
+    {
+        struct nested_sink : chlog::sink {
+            chlog::logger* inner = nullptr;
+            std::vector<std::string> outer;
+            void log(const chlog::log_event& e) override {
+                chlog::detail::text_buffer line;
+                render_to(e, line);
+                if (inner) inner->info("inner {}", std::string(3000, 'i'));
+                outer.emplace_back(line.data(), line.size());
+            }
+        };
+        auto cfg = config();
+        auto inner_sink = std::make_shared<recording_sink>();
+        chlog::logger inner(cfg);
+        inner.add_sink(inner_sink);
+        auto outer_sink = std::make_shared<nested_sink>();
+        chlog::logger outer(cfg);
+        outer.add_sink(outer_sink);
+        // Warm the thread-local list with two long records first, so the nested
+        // call competes with blocks that are resident but not in use.
+        outer.info("warm {}", filled(4000, 'w'));
+        outer.info("warm {}", filled(4000, 'w'));
+        outer_sink->inner = &inner;
+        const auto message = filled(2500, 'o');
+        outer.info("outer {}", message);
+        outer.shutdown();
+        inner.shutdown();
+        CHECK(outer_sink->outer.at(0) == "warm " + filled(4000, 'w'));
+        CHECK(outer_sink->outer.at(1) == "warm " + filled(4000, 'w'));
+        CHECK(outer_sink->outer.at(2) == "outer " + message);
+        CHECK(inner_sink->lines.at(0) == "inner " + filled(3000, 'i'));
+    }
+    // A record logged from a thread_local destructor that outlives this thread's
+    // free list must not touch the list: the block is released directly. The
+    // destructor object is created before the list (the list appears with the
+    // first long record), so it is destroyed after it.
+    {
+        struct late_logger {
+            chlog::logger* logger;
+            ~late_logger() {
+                logger->info("late {}", std::string(2000, 'l'));
+                logger->info("late {}", std::string(3000, 'm'));
+            }
+        };
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<recording_sink>();
+        logger.add_sink(output);
+        std::thread worker([&logger] {
+            static thread_local late_logger late{&logger};
+            (void)late;
+            logger.info("warm {}", std::string(2000, 'w')); // list appears after `late`
+        });
+        worker.join();
+        logger.shutdown();
+        std::set<std::string> got(output->lines.begin(), output->lines.end());
+        const std::set<std::string> want{"warm " + std::string(2000, 'w'),
+                                         "late " + std::string(2000, 'l'),
+                                         "late " + std::string(3000, 'm')};
+        CHECK(got == want);
+    }
+    // Long records from several threads, each thread recycling its own blocks:    // the payload must be per-record exact and nothing may leak between threads.
+    {
+        auto cfg = config();
+        chlog::logger logger(cfg);
+        auto output = std::make_shared<recording_sink>();
+        logger.add_sink(output);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t)
+            threads.emplace_back([&logger, t] {
+                for (int i = 0; i < 8; ++i) {
+                    const auto size = 600 + static_cast<std::size_t>((t * 8 + i) % 5) * 700;
+                    logger.info("t{}-{} {}", t, i, std::string(size, static_cast<char>('a' + t)));
+                }
+            });
+        for (auto& thread : threads) thread.join();
+        logger.shutdown();
+        std::set<std::string> got(output->lines.begin(), output->lines.end());
+        std::set<std::string> want;
+        for (int t = 0; t < 4; ++t)
+            for (int i = 0; i < 8; ++i) {
+                const auto size = 600 + static_cast<std::size_t>((t * 8 + i) % 5) * 700;
+                want.insert("t" + std::to_string(t) + "-" + std::to_string(i) + " " +
+                            std::string(size, static_cast<char>('a' + t)));
+            }
+        CHECK(output->lines.size() == want.size());
+        CHECK(got == want);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     try {
         const std::string_view suite = argv[1];
         if (suite == "formatting") formatting();
+        else if (suite == "fastformat") fastformat_tests();
         else if (suite == "queue") queue_tests();
         else if (suite == "async") async_tests();
         else if (suite == "parallel") parallel_tests();
@@ -951,6 +1346,7 @@ int main(int argc, char** argv) {
         else if (suite == "concurrent") concurrent_tests();
         else if (suite == "configuration") configuration_tests();
         else if (suite == "registration") registration_tests();
+        else if (suite == "reuse") reuse_tests();
         else return 2;
         std::cout << "PASS " << suite << '\n';
     } catch (const std::exception& e) {
