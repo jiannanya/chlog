@@ -74,6 +74,13 @@ view counter sink and `parallel_sinks = false`, a synchronous instance retains
 These figures describe this benchmark configuration.
 Build, sanitizer and package checks are recorded in [validation results](docs/logbench_validation.md).
 
+The [latest optimization report](docs/optimization_round8.md) covers short messages,
+async submission, weighted queues and backpressure, using three revisions and both
+formatting backends. It includes raw samples, remaining regressions, and reproduction
+steps. The [previous report](docs/optimization_round7.md) covers long formatting,
+thread ID caching, JSON escaping and daily-file output. Local validation is on macOS;
+the CI matrix also targets Windows and Linux.
+
 ## Quick Start
 
 ```cpp

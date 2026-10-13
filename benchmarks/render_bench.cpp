@@ -8,7 +8,8 @@
 #pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 #endif
 
-// Counts requested heap bytes during construction, not process RSS.
+// Counts C++ new calls/requested bytes, not process RSS or direct malloc calls
+// (fmt's default memory-buffer allocator uses malloc in some versions).
 namespace {
 std::atomic<bool> track_allocations{false};
 std::atomic<std::size_t> allocated_bytes{0};
@@ -70,8 +71,33 @@ public:
     std::atomic<std::size_t> count{0};
 };
 
+class format_count_sink final : public chlog::view_sink {
+public:
+    void consume(const chlog::log_event_view& event) override { bytes += event.payload.size(); }
+    std::size_t bytes = 0;
+};
+
 int main(int argc, char** argv) {
     const auto iterations = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100000;
+    for (auto size : {64u, 1024u, 16384u}) {
+        chlog::logger_config config;
+        config.single_threaded = true;
+        config.pattern = "{msg}";
+        chlog::logger logger(config);
+        auto output = std::make_shared<format_count_sink>();
+        logger.add_sink(output);
+        const std::string message(size, 'x');
+        for (int i = 0; i < 4; ++i) logger.info("[{:>{}}] {:08x}", message, size + 4, 42);
+        output->bytes = 0;
+        allocation_count = allocated_bytes = 0;
+        track_allocations = true;
+        for (std::uint64_t i = 0; i < iterations; ++i) logger.info("[{:>{}}] {:08x}", message, size + 4, 42);
+        track_allocations = false;
+        std::cout << "FORMAT payload=" << size << " iterations=" << iterations
+                  << " allocations=" << allocation_count.load() << " allocated_bytes=" << allocated_bytes.load()
+                  << " bytes=" << output->bytes << '\n';
+        if (output->bytes != iterations * (size + 15) || logger.stats().errors != 0) return 1;
+    }
     for (const auto pattern : {"{msg}", "[{date} {time}.{ms}][{lvl}][{name}] {msg}", "{json}"}) {
         render_sink output;
         output.set_thread_safe(false);

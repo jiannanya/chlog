@@ -1,0 +1,182 @@
+--- a/include/chlog/chlog.hpp
++++ b/include/chlog/chlog.hpp
+@@ -765,6 +765,34 @@
+ // to callers.
+ inline void buffer_append(text_buffer& out, const char* data, std::size_t size) { out.append(data, size); }
+ 
++#if defined(CHLOG_USE_FMT)
++// Preserve fmt's contiguous-buffer fast path while sharing the bounded block
++// cache with text_buffer. A reused block can be larger than requested;
++// advertise only the requested span on deallocation.
++// This is conservative (never exposes unallocated bytes) and keeps the same
++// two-block / 8192-byte-per-block retention bound.
++template <class T>
++struct buffer_allocator {
++    using value_type = T;
++    using is_always_equal = std::true_type;
++    buffer_allocator() = default;
++    template <class U> buffer_allocator(const buffer_allocator<U>&) noexcept {}
++    T* allocate(std::size_t count) {
++        if constexpr (std::is_same_v<T, char>) {
++            std::size_t capacity = 0;
++            if (local_blocks_alive())
++                if (auto* block = local_blocks().take(count, capacity)) return block;
++            return new char[count];
++        } else return std::allocator<T>{}.allocate(count);
++    }
++    void deallocate(T* block, std::size_t count) noexcept {
++        if constexpr (std::is_same_v<T, char>) recycle_block(block, count);
++        else std::allocator<T>{}.deallocate(block, count);
++    }
++    template <class U> bool operator==(const buffer_allocator<U>&) const noexcept { return true; }
++};
++#endif
++
+ // The owning sink serializes access, or explicitly operates in single-threaded
+ // mode. Accumulate short records before entering the CRT; large writes bypass
+ // the buffer. Storage is allocated on first use and retained across rotation.
+@@ -964,18 +992,22 @@
+         if (pos == s.size()) break;
+         if (pos != begin) out.append(s.data() + begin, pos - begin);
+         const auto c = static_cast<unsigned char>(s[pos++]);
++        char escaped = 0;
+         switch (c) {
+-            case '"': out += "\\\""; break;
+-            case '\\': out += "\\\\"; break;
+-            case '\b': out += "\\b"; break;
+-            case '\f': out += "\\f"; break;
+-            case '\n': out += "\\n"; break;
+-            case '\r': out += "\\r"; break;
+-            case '\t': out += "\\t"; break;
++            case '"': escaped = '"'; break;
++            case '\\': escaped = '\\'; break;
++            case '\b': escaped = 'b'; break;
++            case '\f': escaped = 'f'; break;
++            case '\n': escaped = 'n'; break;
++            case '\r': escaped = 'r'; break;
++            case '\t': escaped = 't'; break;
+             default:
+-                out += "\\u00";
+-                out.push_back(hex[c >> 4]);
+-                out.push_back(hex[c & 15]);
++                const char bytes[] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]};
++                out.append(bytes, sizeof(bytes));
++        }
++        if (escaped) {
++            const char bytes[] = {'\\', escaped};
++            out.append(bytes, sizeof(bytes));
+         }
+         begin = pos;
+     }
+@@ -1007,15 +1039,27 @@
+ }
+ 
+ inline const std::string& cached_thread_id(std::thread::id tid) {
+-    thread_local std::thread::id last;
+-    thread_local std::string text;
+-    thread_local bool valid = false;
+-    if (!valid || last != tid) {
+-        text = thread_id_string(tid);
+-        last = tid;
+-        valid = true;
+-    }
+-    return text;
++    // Async batches interleave producer IDs. Keep a bounded working set so a
++    // change of producer does not construct an iostream for every record. The
++    // most recent entry remains the first check on the single-producer path.
++    struct entry { std::thread::id id{}; std::string text; };
++    thread_local std::array<entry, 16> cache;
++    thread_local std::size_t recent = 0, count = 0, next = 0;
++    if (count && cache[recent].id == tid) return cache[recent].text;
++    for (std::size_t i = 0; i < count; ++i) {
++        if (cache[i].id == tid) {
++            recent = i;
++            return cache[i].text;
++        }
++    }
++    auto text = thread_id_string(tid); // Complete before replacing a valid entry.
++    const auto index = next;
++    cache[index].text = std::move(text);
++    cache[index].id = tid;
++    recent = index;
++    next = (next + 1) % cache.size();
++    if (count < cache.size()) ++count;
++    return cache[index].text;
+ }
+ 
+ inline std::string json_escape(std::string_view s) {
+@@ -1406,17 +1450,23 @@
+     template <class Event>
+     void consume(const Event& e) {
+         if (!accepts(e)) return;
+-        const auto day = date_string(e.ts);
+-        detail::text_buffer line;
+-        render_to(e, line);
+-        line.push_back('\n');
++        if (message_pattern()) write_record(e.ts, e.payload);
++        else {
++            detail::text_buffer line;
++            render_to(e, line);
++            write_record(e.ts, line.view());
++        }
++    }
++
++    void write_record(std::chrono::system_clock::time_point timestamp, std::string_view line) {
++        const auto day = date_string(timestamp);
+         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
+         if (thread_safe_) lk.lock();
+         if (day != current_day_ || !file_.is_open()) {
+             if (file_.is_open()) file_.close();
+             open(day);
+         }
+-        file_.write(line.data(), line.size());
++        file_.write_line(line);
+     }
+ 
+ public:
+@@ -1506,8 +1556,13 @@
+ class spin_mutex {
+ public:
+     void lock() noexcept {
+-        for (unsigned retry = 0; flag_.exchange(true, std::memory_order_acquire); ++retry)
+-            while (flag_.load(std::memory_order_relaxed)) spin_backoff(retry);
++        unsigned retry = 0;
++        while (flag_.exchange(true, std::memory_order_acquire)) {
++            while (flag_.load(std::memory_order_relaxed)) {
++                spin_backoff(retry);
++                if (retry < 32u) ++retry;
++            }
++        }
+     }
+     void unlock() noexcept { flag_.store(false, std::memory_order_release); }
+ private:
+@@ -2428,7 +2483,10 @@
+ #if defined(CHLOG_USE_FMT)
+                 fmt::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
+ #else
+-                std::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
++                // Let the backend own its contiguous output. Besides avoiding
++                // repeated small appends, this avoids libc++ container-iterator
++                // boundary failures when a field fills its 256-byte buffer.
++                buffer = std::format(fmt, std::forward<Args>(args)...);
+ #endif
+             });
+             return;
+@@ -2452,7 +2510,7 @@
+ #if defined(CHLOG_USE_FMT)
+                 fmt::vformat_to(std::back_inserter(buffer), fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
+ #else
+-                std::vformat_to(std::back_inserter(buffer), fmt, std::make_format_args(args...));
++                buffer = std::vformat(fmt, std::make_format_args(args...));
+ #endif
+             });
+             return;
+@@ -2501,7 +2559,7 @@
+         log_guard active(*this);
+         if (!active) return;
+ #if defined(CHLOG_USE_FMT)
+-        fmt::basic_memory_buffer<char, 250> buffer;
++        fmt::basic_memory_buffer<char, 250, detail::buffer_allocator<char>> buffer;
+ #else
+         std::string buffer;
+ #endif

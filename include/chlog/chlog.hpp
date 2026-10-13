@@ -232,6 +232,24 @@ inline int plan_bare_fields(std::string_view text, bare_run* runs, std::size_t m
     return static_cast<int>(count);
 }
 
+template <std::size_t Fields>
+inline bool plan_bare_arguments(std::string_view text, bare_run* runs) noexcept {
+    if constexpr (Fields == 1) {
+        if (text.size() > 0xFFFFFFFFu) return false;
+        // One field needs no variable run counter or indexed stores. Check the
+        // two literal spans directly, including stray/escaped braces in either.
+        std::size_t pos = 0;
+        while (pos < text.size() && text[pos] != '{' && text[pos] != '}') ++pos;
+        if (text.size() - pos < 2 || text[pos] != '{' || text[pos + 1] != '}') return false;
+        if (!has_no_braces(text.substr(pos + 2))) return false;
+        runs[0] = {0, static_cast<std::uint32_t>(pos)};
+        runs[1] = {static_cast<std::uint32_t>(pos + 2), static_cast<std::uint32_t>(text.size() - pos - 2)};
+        return true;
+    } else {
+        return plan_bare_fields(text, runs, (std::min)(Fields, bare_max_fields) + 1) == static_cast<int>(Fields);
+    }
+}
+
 // Appends bytes with a member the output type actually provides. std::string
 // takes (pointer, size); fmt's memory buffer takes a pointer pair. Both also
 // provide push_back, which is all the fast path needs besides this.
@@ -313,12 +331,11 @@ inline bool bare_arguments_valid(const Args&... args) noexcept {
 
 // Emits the literal that precedes one field and then the field itself, so a
 // comma fold over the arguments walks the runs and the fields in lockstep.
-template <class Output, class T>
-inline void emit_bare_field(Output& out, const char* text, const bare_run* runs,
-                            std::size_t& run, const T& value) {
-    append_literal(out, text, runs[run]);
-    ++run;
-    append_bare_value(out, value);
+template <class Output, class... Args, std::size_t... I>
+inline void emit_bare_fields_impl(Output& out, const char* text, const bare_run* runs,
+                                  std::index_sequence<I...>, const Args&... args) {
+    ((append_literal(out, text, runs[I]), append_bare_value(out, args)), ...);
+    append_literal(out, text, runs[sizeof...(Args)]);
 }
 
 // Emits a plan produced by plan_bare_fields() for arguments already checked with
@@ -327,60 +344,73 @@ inline void emit_bare_field(Output& out, const char* text, const bare_run* runs,
 // entered exactly once per accepted record).
 template <class Output, class... Args>
 inline void emit_bare_fields(Output& out, const char* text, const bare_run* runs, const Args&... args) {
-    std::size_t run = 0;
-    (emit_bare_field(out, text, runs, run, args), ...);
-    append_literal(out, text, runs[run]);
+    emit_bare_fields_impl(out, text, runs, std::index_sequence_for<Args...>{}, args...);
 }
 
 template <class Output, class... Args>
 inline bool format_bare_fields(Output& out, std::string_view text, const Args&... args) {
-    bare_run runs[bare_max_fields + 1];
-    const auto fields = plan_bare_fields(text, runs, bare_max_fields + 1);
-    if (fields != static_cast<int>(sizeof...(Args))) return false;
+    constexpr auto max_runs = (std::min)(sizeof...(Args), bare_max_fields) + 1;
+    bare_run runs[max_runs];
+    if (!plan_bare_arguments<sizeof...(Args)>(text, runs)) return false;
     if (!bare_arguments_valid(args...)) return false;
     emit_bare_fields(out, text.data(), runs, args...);
     return true;
 }
 
+// Format into the event's final owning string. Bare fields and literal/string
+// messages avoid returning and then moving another small-string buffer.
 template <class... Args>
-inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
+inline void format_payload_to(std::string& out, format_string<Args...> fmt, Args&&... args) {
     if constexpr (plain_string_argument<Args...>) {
-        // The unadorned string field already is the formatted payload. Keep
-        // ownership semantics: formatting an rvalue does not consume it.
-        if (format_view<Args...>(fmt) == "{}") return std::string(std::string_view(args)...);
+        // Formatting an rvalue still does not consume the caller's argument.
+        if (format_view<Args...>(fmt) == "{}") { out.assign(std::string_view(args)...); return; }
     }
     if constexpr (sizeof...(Args) == 0) {
         const auto text = format_view<>(fmt);
-        if (has_no_braces(text)) return std::string(text);
+        if (has_no_braces(text)) { out.assign(text); return; }
     }
     if constexpr (bare_field_arguments<Args...>) {
-        std::string out;
-        if (format_bare_fields(out, format_view<Args...>(fmt), args...)) return out;
+        out.clear();
+        if (format_bare_fields(out, format_view<Args...>(fmt), args...)) return;
     }
 #if defined(CHLOG_USE_FMT)
-    return fmt::format(fmt, std::forward<Args>(args)...);
+    out = fmt::format(fmt, std::forward<Args>(args)...);
 #else
-    return std::format(fmt, std::forward<Args>(args)...);
+    out = std::format(fmt, std::forward<Args>(args)...);
 #endif
 }
 
 template <class... Args>
-inline std::string vformat_payload(std::string_view fmt, Args&&... args) {
+inline void vformat_payload_to(std::string& out, std::string_view fmt, Args&&... args) {
     if constexpr (plain_string_argument<Args...>) {
-        if (fmt == "{}") return std::string(std::string_view(args)...);
+        if (fmt == "{}") { out.assign(std::string_view(args)...); return; }
     }
     if constexpr (sizeof...(Args) == 0) {
-        if (has_no_braces(fmt)) return std::string(fmt);
+        if (has_no_braces(fmt)) { out.assign(fmt); return; }
     }
     if constexpr (bare_field_arguments<Args...>) {
-        std::string out;
-        if (format_bare_fields(out, fmt, args...)) return out;
+        out.clear();
+        if (format_bare_fields(out, fmt, args...)) return;
     }
 #if defined(CHLOG_USE_FMT)
-    return fmt::vformat(fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
+    out = fmt::vformat(fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
 #else
-    return std::vformat(fmt, std::make_format_args(args...));
+    out = std::vformat(fmt, std::make_format_args(args...));
 #endif
+}
+
+template <class... Args>
+inline std::string format_payload(format_string<Args...> fmt, Args&&... args) {
+    std::string out;
+    format_payload_to(out, fmt, std::forward<Args>(args)...);
+    return out;
+}
+
+template <class... Args>
+inline std::string vformat_payload(std::string_view fmt, Args&&... args) {
+    std::string out;
+    vformat_payload_to(out, fmt, std::forward<Args>(args)...);
+    return out;
 }
 
 
@@ -765,6 +795,34 @@ private:
 // to callers.
 inline void buffer_append(text_buffer& out, const char* data, std::size_t size) { out.append(data, size); }
 
+#if defined(CHLOG_USE_FMT)
+// Preserve fmt's contiguous-buffer fast path while sharing the bounded block
+// cache with text_buffer. A reused block can be larger than requested;
+// advertise only the requested span on deallocation.
+// This is conservative (never exposes unallocated bytes) and keeps the same
+// two-block / 8192-byte-per-block retention bound.
+template <class T>
+struct buffer_allocator {
+    using value_type = T;
+    using is_always_equal = std::true_type;
+    buffer_allocator() = default;
+    template <class U> buffer_allocator(const buffer_allocator<U>&) noexcept {}
+    T* allocate(std::size_t count) {
+        if constexpr (std::is_same_v<T, char>) {
+            std::size_t capacity = 0;
+            if (local_blocks_alive())
+                if (auto* block = local_blocks().take(count, capacity)) return block;
+            return new char[count];
+        } else return std::allocator<T>{}.allocate(count);
+    }
+    void deallocate(T* block, std::size_t count) noexcept {
+        if constexpr (std::is_same_v<T, char>) recycle_block(block, count);
+        else std::allocator<T>{}.deallocate(block, count);
+    }
+    template <class U> bool operator==(const buffer_allocator<U>&) const noexcept { return true; }
+};
+#endif
+
 // The owning sink serializes access, or explicitly operates in single-threaded
 // mode. Accumulate short records before entering the CRT; large writes bypass
 // the buffer. Storage is allocated on first use and retained across rotation.
@@ -964,18 +1022,22 @@ inline void append_json_escaped(Output& out, std::string_view s) {
         if (pos == s.size()) break;
         if (pos != begin) out.append(s.data() + begin, pos - begin);
         const auto c = static_cast<unsigned char>(s[pos++]);
+        char escaped = 0;
         switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
+            case '"': escaped = '"'; break;
+            case '\\': escaped = '\\'; break;
+            case '\b': escaped = 'b'; break;
+            case '\f': escaped = 'f'; break;
+            case '\n': escaped = 'n'; break;
+            case '\r': escaped = 'r'; break;
+            case '\t': escaped = 't'; break;
             default:
-                out += "\\u00";
-                out.push_back(hex[c >> 4]);
-                out.push_back(hex[c & 15]);
+                const char bytes[] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]};
+                out.append(bytes, sizeof(bytes));
+        }
+        if (escaped) {
+            const char bytes[] = {'\\', escaped};
+            out.append(bytes, sizeof(bytes));
         }
         begin = pos;
     }
@@ -1007,15 +1069,27 @@ inline std::string thread_id_string(std::thread::id tid) {
 }
 
 inline const std::string& cached_thread_id(std::thread::id tid) {
-    thread_local std::thread::id last;
-    thread_local std::string text;
-    thread_local bool valid = false;
-    if (!valid || last != tid) {
-        text = thread_id_string(tid);
-        last = tid;
-        valid = true;
+    // Async batches interleave producer IDs. Keep a bounded working set so a
+    // change of producer does not construct an iostream for every record. The
+    // most recent entry remains the first check on the single-producer path.
+    struct entry { std::thread::id id{}; std::string text; };
+    thread_local std::array<entry, 16> cache;
+    thread_local std::size_t recent = 0, count = 0, next = 0;
+    if (count && cache[recent].id == tid) return cache[recent].text;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (cache[i].id == tid) {
+            recent = i;
+            return cache[i].text;
+        }
     }
-    return text;
+    auto text = thread_id_string(tid); // Complete before replacing a valid entry.
+    const auto index = next;
+    cache[index].text = std::move(text);
+    cache[index].id = tid;
+    recent = index;
+    next = (next + 1) % cache.size();
+    if (count < cache.size()) ++count;
+    return cache[index].text;
 }
 
 inline std::string json_escape(std::string_view s) {
@@ -1406,17 +1480,23 @@ private:
     template <class Event>
     void consume(const Event& e) {
         if (!accepts(e)) return;
-        const auto day = date_string(e.ts);
-        detail::text_buffer line;
-        render_to(e, line);
-        line.push_back('\n');
+        if (message_pattern()) write_record(e.ts, e.payload);
+        else {
+            detail::text_buffer line;
+            render_to(e, line);
+            write_record(e.ts, line.view());
+        }
+    }
+
+    void write_record(std::chrono::system_clock::time_point timestamp, std::string_view line) {
+        const auto day = date_string(timestamp);
         std::unique_lock<std::mutex> lk(m_, std::defer_lock);
         if (thread_safe_) lk.lock();
         if (day != current_day_ || !file_.is_open()) {
             if (file_.is_open()) file_.close();
             open(day);
         }
-        file_.write(line.data(), line.size());
+        file_.write_line(line);
     }
 
 public:
@@ -1506,8 +1586,13 @@ inline void spin_backoff(unsigned iteration) noexcept {
 class spin_mutex {
 public:
     void lock() noexcept {
-        for (unsigned retry = 0; flag_.exchange(true, std::memory_order_acquire); ++retry)
-            while (flag_.load(std::memory_order_relaxed)) spin_backoff(retry);
+        unsigned retry = 0;
+        while (flag_.exchange(true, std::memory_order_acquire)) {
+            while (flag_.load(std::memory_order_relaxed)) {
+                spin_backoff(retry);
+                if (retry < 32u) ++retry;
+            }
+        }
     }
     void unlock() noexcept { flag_.store(false, std::memory_order_release); }
 private:
@@ -1519,6 +1604,7 @@ struct queue_wait {
     std::binary_semaphore sem_not_empty{0};
     std::atomic<bool> stop{false};
     alignas(64) std::atomic<std::size_t> space_epoch{0};
+    std::atomic<std::size_t> space_waiters{0};
 
     void notify_data() noexcept {
         // Always exchange: the consumer's acquire exchange synchronizes with
@@ -1526,8 +1612,8 @@ struct queue_wait {
         if (sleeping.exchange(false, std::memory_order_acq_rel)) sem_not_empty.release();
     }
     void notify_space() noexcept {
-        space_epoch.fetch_add(1, std::memory_order_release);
-        space_epoch.notify_all();
+        space_epoch.fetch_add(1, std::memory_order_seq_cst);
+        if (space_waiters.load(std::memory_order_seq_cst)) space_epoch.notify_all();
     }
     template <class Ready>
     void wait_for_data(std::chrono::milliseconds duration, Ready ready) {
@@ -1596,16 +1682,35 @@ public:
     }
 
     bool push_blocking(T&& value) {
+        if (try_push(std::move(value))) return true;
+        if (!wait_) {
+            while (!try_push(std::move(value))) std::this_thread::yield();
+            return true;
+        }
+        // Join before sampling the epoch. In SC order, either the consumer
+        // observes this waiter and notifies, or our epoch load observes its
+        // publication and the retry sees the released slot / stop flag.
+        // The usual non-full producer path never touches the waiter count.
+        wait_->space_waiters.fetch_add(1, std::memory_order_seq_cst);
+        bool accepted = false;
         for (;;) {
-            const auto epoch = wait_ ? wait_->space_epoch.load(std::memory_order_acquire) : 0;
-            if (try_push(std::move(value))) return true;
-            if (!wait_) { std::this_thread::yield(); continue; }
-            if (wait_->stop.load(std::memory_order_acquire)) return false;
+            const auto epoch = wait_->space_epoch.load(std::memory_order_seq_cst);
+            if ((accepted = try_push(std::move(value)))) break;
+            if (wait_->stop.load(std::memory_order_acquire)) break;
             wait_->space_epoch.wait(epoch, std::memory_order_acquire);
         }
+        wait_->space_waiters.fetch_sub(1, std::memory_order_seq_cst);
+        return accepted;
     }
 
     std::size_t pop_batch(std::vector<T>& out, std::size_t max_batch) {
+        const auto n = pop_batch_unnotified(out, max_batch);
+        if (n && wait_) wait_->notify_space();
+        return n;
+    }
+    // The dual queue releases both tiers before sending one shared space
+    // notification. Standalone ring consumers use pop_batch() above.
+    std::size_t pop_batch_unnotified(std::vector<T>& out, std::size_t max_batch) {
         const auto limit = (std::min)(max_batch, cap_);
         if (limit > out.max_size() - out.size()) throw std::length_error("chlog: batch too large");
         // Reserve before releasing any slots, so allocation failure leaves the
@@ -1625,10 +1730,7 @@ public:
             ++n;
             if (++offset == cap_) offset = 0;
         }
-        if (n) {
-            head_.store(pos, std::memory_order_release);
-            if (wait_) wait_->notify_space();
-        }
+        if (n) head_.store(pos, std::memory_order_release);
         return n;
     }
     void wait_for_data(std::chrono::milliseconds duration) {
@@ -1698,11 +1800,18 @@ public:
         if (!hi_) return lo_.pop_batch(out, max_batch);
         // Give both tiers service, including batch_max == 1.
         std::size_t n = 0;
-        if (max_batch == 1 && low_first_) n += lo_.pop_batch(out, 1);
+        struct notify_released {
+            detail::queue_wait& wait;
+            const std::size_t& count;
+            // If a later tier fails to reserve output storage, slots released
+            // by an earlier tier must still wake blocked producers.
+            ~notify_released() { if (count) wait.notify_space(); }
+        } notify{wait_, n};
+        if (max_batch == 1 && low_first_) n += lo_.pop_batch_unnotified(out, 1);
         low_first_ = !low_first_;
-        if (n < max_batch) n += hi_->pop_batch(out, std::max<std::size_t>(1, max_batch - max_batch / 4) - n);
-        if (n < max_batch) n += lo_.pop_batch(out, max_batch - n);
-        if (n < max_batch) n += hi_->pop_batch(out, max_batch - n);
+        if (n < max_batch) n += hi_->pop_batch_unnotified(out, std::max<std::size_t>(1, max_batch - max_batch / 4) - n);
+        if (n < max_batch) n += lo_.pop_batch_unnotified(out, max_batch - n);
+        if (n < max_batch) n += hi_->pop_batch_unnotified(out, max_batch - n);
         return n;
     }
     void wait_for_data(std::chrono::milliseconds duration) {
@@ -2166,7 +2275,7 @@ public:
                  const std::source_location& loc = std::source_location::current()) {
         if (!should_log(lv)) return;
         if (inline_dispatch()) { submit_view(lv, loc, message); return; }
-        submit(lv, loc, [&] { return std::string(message); }, message);
+        submit(lv, loc, [&](std::string& out) { out.assign(message); }, message);
     }
 
     template <class... Args>
@@ -2428,12 +2537,15 @@ private:
 #if defined(CHLOG_USE_FMT)
                 fmt::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
 #else
-                std::format_to(std::back_inserter(buffer), fmt, std::forward<Args>(args)...);
+                // Let the backend own its contiguous output. Besides avoiding
+                // repeated small appends, this avoids libc++ container-iterator
+                // boundary failures when a field fills its 256-byte buffer.
+                buffer = std::format(fmt, std::forward<Args>(args)...);
 #endif
             });
             return;
         }
-        submit(lv, loc, [&] { return detail::format_payload(fmt, std::forward<Args>(args)...); },
+        submit(lv, loc, [&](std::string& out) { detail::format_payload_to(out, fmt, std::forward<Args>(args)...); },
                detail::format_view<Args...>(fmt));
     }
     template <class... Args>
@@ -2452,12 +2564,12 @@ private:
 #if defined(CHLOG_USE_FMT)
                 fmt::vformat_to(std::back_inserter(buffer), fmt::string_view(fmt.data(), fmt.size()), fmt::make_format_args(args...));
 #else
-                std::vformat_to(std::back_inserter(buffer), fmt, std::make_format_args(args...));
+                buffer = std::vformat(fmt, std::make_format_args(args...));
 #endif
             });
             return;
         }
-        submit(lv, loc, [&] { return detail::vformat_payload(fmt, std::forward<Args>(args)...); }, fmt);
+        submit(lv, loc, [&](std::string& out) { detail::vformat_payload_to(out, fmt, std::forward<Args>(args)...); }, fmt);
     }
     // Renders the accepted subset straight into a stack buffer: no owning string
     // and no library formatting call. Returns false when the text is outside the
@@ -2465,9 +2577,9 @@ private:
     // caller can hand the record to the general formatter instead.
     template <class... Args>
     bool submit_bare(level lv, const std::source_location& loc, std::string_view text, const Args&... args) {
-        detail::bare_run runs[detail::bare_max_fields + 1];
-        const auto fields = detail::plan_bare_fields(text, runs, detail::bare_max_fields + 1);
-        if (fields != static_cast<int>(sizeof...(Args))) return false;
+        constexpr auto max_runs = (std::min)(sizeof...(Args), detail::bare_max_fields) + 1;
+        detail::bare_run runs[max_runs];
+        if (!detail::plan_bare_arguments<sizeof...(Args)>(text, runs)) return false;
         if (!detail::bare_arguments_valid(args...)) return false;
         log_guard active(*this);
         if (!active) return true;
@@ -2501,7 +2613,7 @@ private:
         log_guard active(*this);
         if (!active) return;
 #if defined(CHLOG_USE_FMT)
-        fmt::basic_memory_buffer<char, 250> buffer;
+        fmt::basic_memory_buffer<char, 250, detail::buffer_allocator<char>> buffer;
 #else
         std::string buffer;
 #endif
@@ -2536,14 +2648,33 @@ private:
     void submit(level lv, const std::source_location& loc, Format format, std::string_view fallback) {
         log_guard active(*this);
         if (!active) return;
-        log_event e;
         const auto capture = capture_mask_.load(std::memory_order_acquire);
+        if (queue_) {
+            // Construct the compact queue record directly. In particular, short
+            // payloads need no intermediate owning event / small-string move.
+            detail::queued_event queued;
+            if (capture & sink::timestamp) queued.ts = detail::wall_now();
+            if (capture & sink::thread_id) queued.tid = std::this_thread::get_id();
+            if (capture & sink::source_location) queued.loc = loc;
+            queued.capture_name = (capture & sink::logger_name) != 0;
+            queued.lvl = lv;
+            queued.seq = active.sequence;
+            try { format(queued.payload); }
+            catch (...) { error(); queued.payload = fallback; }
+            const int weight = level_weight(lv);
+            bool accepted = queue_->try_push(std::move(queued), weight);
+            if (!accepted && (!async_->config.drop_when_full || lv >= level::warn))
+                accepted = queue_->push_blocking(std::move(queued), weight);
+            if (!accepted) async_->dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        log_event e;
         if (capture & sink::timestamp) e.ts = detail::wall_now();
         if (capture & sink::thread_id) e.tid = std::this_thread::get_id();
-        if ((capture & sink::logger_name) && !queue_) e.name = name_;
+        if (capture & sink::logger_name) e.name = name_;
         if (capture & sink::source_location) e.loc = loc;
         e.lvl = lv;
-        try { e.payload = format(); }
+        try { format(e.payload); }
         catch (...) { error(); e.payload = fallback; }
         if (single_threaded_) {
             e.seq = increment_local(counters().entries);
@@ -2553,15 +2684,6 @@ private:
             return;
         }
         e.seq = active.sequence;
-        if (queue_) {
-            const int weight = level_weight(lv);
-            detail::queued_event queued(std::move(e), (capture & sink::logger_name) != 0);
-            bool accepted = queue_->try_push(std::move(queued), weight);
-            if (!accepted && (!async_->config.drop_when_full || lv >= level::warn))
-                accepted = queue_->push_blocking(std::move(queued), weight);
-            if (!accepted) async_->dropped.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
         auto current = current_sinks();
         if (auto* pool = current_parallel(); pool && current && !current.empty()) {
             // Each event owns its strings once; all per-sink tasks share it.

@@ -1,0 +1,19 @@
+FORMAT payload=64 iterations=2000 allocations=0 allocated_bytes=0 bytes=158000
+FORMAT payload=1024 iterations=2000 allocations=0 allocated_bytes=0 bytes=2078000
+FORMAT payload=16384 iterations=2000 allocations=4000 allocated_bytes=81944000 bytes=32798000
+RENDER pattern={msg} iterations=2000 seconds=4.3583e-05 allocations=2000 bytes=156000
+BUFFER pattern={msg} payload=128 iterations=2000 seconds=1.1417e-05 allocations=0 allocated_bytes=0 bytes=414129
+BUFFER pattern={msg} payload=1024 iterations=2000 seconds=3.75e-05 allocations=0 allocated_bytes=0 bytes=2465154
+RENDER pattern=[{date} {time}.{ms}][{lvl}][{name}] {msg} iterations=2000 seconds=0.000110334 allocations=2000 bytes=297000
+BUFFER pattern=[{date} {time}.{ms}][{lvl}][{name}] {msg} payload=128 iterations=2000 seconds=4.0667e-05 allocations=0 allocated_bytes=0 bytes=649176
+BUFFER pattern=[{date} {time}.{ms}][{lvl}][{name}] {msg} payload=1024 iterations=2000 seconds=7.6042e-05 allocations=0 allocated_bytes=0 bytes=2794248
+RENDER pattern={json} iterations=2000 seconds=0.000132208 allocations=2000 bytes=562890
+BUFFER pattern={json} payload=128 iterations=2000 seconds=8.2542e-05 allocations=0 allocated_bytes=0 bytes=1094043
+BUFFER pattern={json} payload=1024 iterations=2000 seconds=0.000271291 allocations=0 allocated_bytes=0 bytes=3418092
+MEMORY queue_capacity=65536 allocated_bytes=4736064 allocations=10
+ASYNC_NAME iterations=2000 allocated_bytes=0 allocations=0 processed=2001
+REGISTRATION sinks=16 allocated_bytes=2656 allocations=47
+REGISTRATION sinks=256 allocated_bytes=42976 allocations=767
+REGISTRATION sinks=1024 allocated_bytes=172000 allocations=3071
+END_TO_END case=sync_pattern iterations=2000 seconds=0.000229417 bytes=200890
+END_TO_END case=async_pattern iterations=2000 seconds=0.000223334 bytes=200890

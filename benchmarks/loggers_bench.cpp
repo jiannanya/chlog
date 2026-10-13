@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #if defined(CHLOG_HAS_SPDLOG)
   #include <spdlog/async.h>
@@ -27,6 +28,7 @@ using clock_t = std::chrono::steady_clock;
 struct bench_config {
   std::uint64_t iters = 1'000'000;
   bool spdlog_first = false;
+  std::vector<std::string_view> cases;
 };
 
 std::optional<std::uint64_t> getenv_u64(const char* name) {
@@ -78,6 +80,7 @@ bench_config parse_args(int argc, char** argv) {
       ++i;
     }
     if (a == "--spdlog-first") cfg.spdlog_first = true;
+    if (a == "--case" && (i + 1) < argc) cfg.cases.emplace_back(argv[++i]);
   }
 
   if (cfg.iters == 0) {
@@ -245,7 +248,7 @@ run_result bench_chlog_filtered_out(std::uint64_t iters) {
   return r;
 }
 
-template <bool Plain = false, std::size_t PayloadBytes = 0>
+template <bool Plain = false, std::size_t PayloadBytes = 0, std::size_t Capacity = 65536, bool Weighted = false>
 run_result bench_chlog_async_mt(std::uint64_t iters, unsigned producers = 1) {
   std::atomic<std::uint64_t> processed{0};
 
@@ -254,8 +257,8 @@ run_result bench_chlog_async_mt(std::uint64_t iters, unsigned producers = 1) {
   cfg.level = chlog::level::info;
   cfg.single_threaded = false;
   cfg.async.enabled = true;
-  cfg.async.queue_capacity = 65536;
-  cfg.async.weighted_queue = false; // Same FIFO capacity as spdlog.
+  cfg.async.queue_capacity = Capacity;
+  cfg.async.weighted_queue = Weighted; // Default cases use the same FIFO capacity as spdlog.
   cfg.async.drop_when_full = false;
   cfg.async.batch_max = 256;
   cfg.async.flush_every = std::chrono::milliseconds(0);
@@ -270,7 +273,8 @@ run_result bench_chlog_async_mt(std::uint64_t iters, unsigned producers = 1) {
   auto produce = [&](unsigned thread) {
     for (std::uint64_t i = thread; i < iters; i += producers) {
       if constexpr (PayloadBytes != 0) lg->info("{}", payload);
-    else if constexpr (Plain) lg->info("message ready");
+      else if constexpr (Plain) lg->info("message ready");
+      else if constexpr (Weighted) lg->log(i % 8 ? chlog::level::info : chlog::level::warn, "v {}", i);
       else lg->info("v {}", i);
     }
   };
@@ -289,6 +293,8 @@ run_result bench_chlog_async_mt(std::uint64_t iters, unsigned producers = 1) {
   r.bench_case = producers == 1 ? "async_mt" : "async_4p";
   if constexpr (Plain) r.bench_case += "_literal";
   if constexpr (PayloadBytes != 0) r.bench_case += "_payload" + std::to_string(PayloadBytes);
+  if constexpr (Capacity != 65536) r.bench_case += "_q" + std::to_string(Capacity);
+  if constexpr (Weighted) r.bench_case += "_weighted";
   r.calls = iters;
   r.seconds = std::chrono::duration<double>(t1 - t0).count();
   r.processed = processed.load(std::memory_order_relaxed);
@@ -449,44 +455,54 @@ int main(int argc, char** argv) {
 #elif defined(__GNUC__)
   std::cout << " compiler=gcc-" << __GNUC__ << '.' << __GNUC_MINOR__ << '.' << __GNUC_PATCHLEVEL__;
 #endif
-  std::cout << " queue_capacity=65536 overflow=block sink=atomic_counter\n";
+  std::cout << " default_queue_capacity=65536 overflow=block sink=atomic_counter\n";
 
+  std::size_t selected = 0;
+  const auto run = [&](std::string_view name, auto work) {
+    if (!cfg.cases.empty() && std::find(cfg.cases.begin(), cfg.cases.end(), name) == cfg.cases.end()) return;
+    ++selected;
+    print_result(work());
+  };
   auto run_chlog = [&] {
-  print_result(bench_chlog_filtered_out(cfg.iters));
-  print_result(bench_chlog_sync(true, cfg.iters));
-  print_result(bench_chlog_sync(false, cfg.iters));
-  print_result(bench_chlog_parallel<1>(cfg.iters));
-  print_result(bench_chlog_parallel<2>(cfg.iters));
-  print_result(bench_chlog_parallel<4>(cfg.iters));
-  print_result(bench_chlog_async_mt(cfg.iters));
-  print_result(bench_chlog_async_mt(cfg.iters, 4));
-  print_result(bench_chlog_sync<true>(true, cfg.iters));
-  print_result(bench_chlog_sync<true>(false, cfg.iters));
-  print_result(bench_chlog_async_mt<true>(cfg.iters));
-  print_result(bench_chlog_sync<false, 128>(true, cfg.iters));
-  print_result(bench_chlog_sync<false, 128>(false, cfg.iters));
-  print_result(bench_chlog_sync<false, 1024>(true, cfg.iters));
-  print_result(bench_chlog_sync<false, 1024>(false, cfg.iters));
-  print_result(bench_chlog_async_mt<false, 128>(cfg.iters));
-  print_result(bench_chlog_async_mt<false, 1024>(cfg.iters));
+  run("filtered_out", [&] { return bench_chlog_filtered_out(cfg.iters); });
+  run("sync_st", [&] { return bench_chlog_sync(true, cfg.iters); });
+  run("sync_mt", [&] { return bench_chlog_sync(false, cfg.iters); });
+  run("sync_parallel1", [&] { return bench_chlog_parallel<1>(cfg.iters); });
+  run("sync_parallel2", [&] { return bench_chlog_parallel<2>(cfg.iters); });
+  run("sync_parallel4", [&] { return bench_chlog_parallel<4>(cfg.iters); });
+  run("async_mt", [&] { return bench_chlog_async_mt(cfg.iters); });
+  run("async_4p", [&] { return bench_chlog_async_mt(cfg.iters, 4); });
+  run("sync_st_literal", [&] { return bench_chlog_sync<true>(true, cfg.iters); });
+  run("sync_mt_literal", [&] { return bench_chlog_sync<true>(false, cfg.iters); });
+  run("async_mt_literal", [&] { return bench_chlog_async_mt<true>(cfg.iters); });
+  run("sync_st_payload128", [&] { return bench_chlog_sync<false, 128>(true, cfg.iters); });
+  run("sync_mt_payload128", [&] { return bench_chlog_sync<false, 128>(false, cfg.iters); });
+  run("sync_st_payload1024", [&] { return bench_chlog_sync<false, 1024>(true, cfg.iters); });
+  run("sync_mt_payload1024", [&] { return bench_chlog_sync<false, 1024>(false, cfg.iters); });
+  run("async_mt_payload128", [&] { return bench_chlog_async_mt<false, 128>(cfg.iters); });
+  run("async_mt_payload1024", [&] { return bench_chlog_async_mt<false, 1024>(cfg.iters); });
+  run("async_mt_q8", [&] { return bench_chlog_async_mt<false, 0, 8>(cfg.iters); });
+  run("async_4p_q8", [&] { return bench_chlog_async_mt<false, 0, 8>(cfg.iters, 4); });
+  run("async_mt_weighted", [&] { return bench_chlog_async_mt<false, 0, 65536, true>(cfg.iters); });
+  run("async_4p_weighted", [&] { return bench_chlog_async_mt<false, 0, 65536, true>(cfg.iters, 4); });
   };
 
 #if defined(CHLOG_HAS_SPDLOG)
   auto run_spdlog = [&] {
-  print_result(bench_spdlog_filtered_out(cfg.iters));
-  print_result(bench_spdlog_sync(true, cfg.iters));
-  print_result(bench_spdlog_sync(false, cfg.iters));
-  print_result(bench_spdlog_async_mt(cfg.iters));
-  print_result(bench_spdlog_async_mt(cfg.iters, 4));
-  print_result(bench_spdlog_sync<true>(true, cfg.iters));
-  print_result(bench_spdlog_sync<true>(false, cfg.iters));
-  print_result(bench_spdlog_async_mt<true>(cfg.iters));
-  print_result(bench_spdlog_sync<false, 128>(true, cfg.iters));
-  print_result(bench_spdlog_sync<false, 128>(false, cfg.iters));
-  print_result(bench_spdlog_sync<false, 1024>(true, cfg.iters));
-  print_result(bench_spdlog_sync<false, 1024>(false, cfg.iters));
-  print_result(bench_spdlog_async_mt<false, 128>(cfg.iters));
-  print_result(bench_spdlog_async_mt<false, 1024>(cfg.iters));
+  run("filtered_out", [&] { return bench_spdlog_filtered_out(cfg.iters); });
+  run("sync_st", [&] { return bench_spdlog_sync(true, cfg.iters); });
+  run("sync_mt", [&] { return bench_spdlog_sync(false, cfg.iters); });
+  run("async_mt", [&] { return bench_spdlog_async_mt(cfg.iters); });
+  run("async_4p", [&] { return bench_spdlog_async_mt(cfg.iters, 4); });
+  run("sync_st_literal", [&] { return bench_spdlog_sync<true>(true, cfg.iters); });
+  run("sync_mt_literal", [&] { return bench_spdlog_sync<true>(false, cfg.iters); });
+  run("async_mt_literal", [&] { return bench_spdlog_async_mt<true>(cfg.iters); });
+  run("sync_st_payload128", [&] { return bench_spdlog_sync<false, 128>(true, cfg.iters); });
+  run("sync_mt_payload128", [&] { return bench_spdlog_sync<false, 128>(false, cfg.iters); });
+  run("sync_st_payload1024", [&] { return bench_spdlog_sync<false, 1024>(true, cfg.iters); });
+  run("sync_mt_payload1024", [&] { return bench_spdlog_sync<false, 1024>(false, cfg.iters); });
+  run("async_mt_payload128", [&] { return bench_spdlog_async_mt<false, 128>(cfg.iters); });
+  run("async_mt_payload1024", [&] { return bench_spdlog_async_mt<false, 1024>(cfg.iters); });
   };
   if (cfg.spdlog_first) { run_spdlog(); run_chlog(); }
   else { run_chlog(); run_spdlog(); }
@@ -495,5 +511,9 @@ int main(int argc, char** argv) {
   std::cerr << "NOTE: spdlog not available (build without CHLOG_HAS_SPDLOG).\n";
 #endif
 
+  if (!selected) {
+    std::cerr << "No matching benchmark cases.\n";
+    return 2;
+  }
   return benchmark_failed ? 1 : 0;
 }

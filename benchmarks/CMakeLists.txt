@@ -38,6 +38,9 @@ endif()
 add_executable(chlog_render_bench ${CMAKE_CURRENT_LIST_DIR}/render_bench.cpp)
 target_link_libraries(chlog_render_bench PRIVATE chlog::chlog)
 
+add_executable(chlog_bench_hotpaths ${CMAKE_CURRENT_LIST_DIR}/hotpaths_bench.cpp)
+target_link_libraries(chlog_bench_hotpaths PRIVATE chlog::chlog)
+
 if (MSVC)
   target_compile_options(chlog_bench_loggers PRIVATE /W4 /permissive-)
 else()

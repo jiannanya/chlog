@@ -8,6 +8,7 @@
 using namespace std::chrono_literals;
 
 struct custom_value { int value; };
+struct nested_value { chlog::logger* inner; std::string_view text; };
 #if defined(CHLOG_USE_FMT)
 template <> struct fmt::formatter<custom_value> : fmt::formatter<int> {
 #else
@@ -15,6 +16,17 @@ template <> struct std::formatter<custom_value> : std::formatter<int> {
 #endif
     template <class Context> auto format(const custom_value& value, Context& context) const {
         return formatter<int>::format(value.value, context);
+    }
+};
+
+#if defined(CHLOG_USE_FMT)
+template <> struct fmt::formatter<nested_value> : fmt::formatter<std::string_view> {
+#else
+template <> struct std::formatter<nested_value> : std::formatter<std::string_view> {
+#endif
+    template <class Context> auto format(const nested_value& value, Context& context) const {
+        value.inner->info("inner [{:>3100}]", std::string(3000, 'i'));
+        return formatter<std::string_view>::format(value.text, context);
     }
 };
 
@@ -356,6 +368,50 @@ void queue_tests() {
     }
     consumer.join();
     wake.signal_stop();
+
+    // Exercise producers joining/leaving the full-queue wait while the consumer
+    // alternates single-slot releases and batches. Also covers shared waiters
+    // on the two weighted rings, whose space epochs are shared.
+    for (bool weighted : {false, true}) {
+        chlog::dual_queue<std::string> bounded(4, weighted);
+        std::vector<std::thread> writers;
+        for (int t = 0; t < 4; ++t) writers.emplace_back([&, t] {
+            for (int i = 0; i < 1000; ++i)
+                CHECK(bounded.push_blocking(std::to_string(t * 1000 + i), t % 2 ? 3 : 1));
+        });
+        std::set<std::string> received;
+        std::vector<std::string> values;
+        std::size_t records = 0;
+        while (records < 4000) {
+            values.clear();
+            if (!bounded.pop_batch(values, records % 3 + 1)) {
+                bounded.wait_for_data(100ms);
+                continue;
+            }
+            records += values.size();
+            received.insert(values.begin(), values.end());
+            if (records % 17 == 0) std::this_thread::yield();
+        }
+        for (auto& writer : writers) writer.join();
+        CHECK(received.size() == 4000);
+        CHECK(bounded.size_relaxed() == 0);
+    }
+
+    chlog::dual_queue<std::string> stopping(4, false);
+    for (int i = 0; i < 4; ++i) CHECK(stopping.try_push(std::string("occupied"), 1));
+    std::vector<std::future<bool>> blocked_writers;
+    for (int i = 0; i < 6; ++i) blocked_writers.push_back(std::async(std::launch::async, [&] {
+        std::string pending = "preserved";
+        const bool accepted = stopping.push_blocking(std::move(pending), 1);
+        CHECK(pending == "preserved");
+        return accepted;
+    }));
+    for (auto& writer : blocked_writers) CHECK(writer.wait_for(10ms) == std::future_status::timeout);
+    stopping.signal_stop();
+    for (auto& writer : blocked_writers) {
+        CHECK(writer.wait_for(5s) == std::future_status::ready);
+        CHECK(!writer.get());
+    }
 }
 
 void async_tests() {
@@ -450,6 +506,54 @@ void async_tests() {
     named.set_pattern("{name}|{msg}");
     named.info("restored"); named.shutdown();
     CHECK(recorded->events.at(2).name == cfg.name);
+
+    // Direct queue construction must preserve producer metadata, payload
+    // ownership, sequence numbers and formatting failure recovery in both sink
+    // interfaces. Cross the small-string and long-string boundaries repeatedly.
+    for (bool views : {false, true}) {
+        auto direct_cfg = config();
+        direct_cfg.name = std::string(80, 'n');
+        direct_cfg.pattern = "{name}|{msg}";
+        direct_cfg.async.enabled = true;
+        direct_cfg.async.drop_when_full = false;
+        direct_cfg.async.weighted_queue = false;
+        direct_cfg.async.queue_capacity = 3;
+        direct_cfg.async.batch_max = 1;
+        chlog::logger direct(direct_cfg);
+        auto owned = std::make_shared<recording_sink>();
+        auto viewed = std::make_shared<recording_view_sink>();
+        direct.add_sink(views ? std::static_pointer_cast<chlog::sink>(viewed) : owned);
+        std::vector<std::string> expected;
+        const auto loc = std::source_location::current();
+        const auto start = std::chrono::system_clock::now();
+        for (auto size : {0u, 1u, 15u, 16u, 22u, 23u, 128u, 1024u}) {
+            std::string message(size, 'x');
+            if (size) message[size / 2] = '\0';
+            expected.push_back(message);
+            direct.log_at(chlog::level::info, loc, "{}", std::move(message));
+            CHECK(message == expected.back());
+            message.assign("caller reused storage");
+        }
+        const std::string_view broken = "{:>2048} {missing}";
+        direct.log_at(chlog::level::warn, loc, broken, "partial");
+        expected.emplace_back(broken);
+        direct.log_at(chlog::level::info, loc, "{}:{}", 7, custom_value{8});
+        expected.emplace_back("7:8");
+        direct.shutdown();
+        const auto finish = std::chrono::system_clock::now();
+        const auto& events = views ? viewed->events : owned->events;
+        CHECK(events.size() == expected.size());
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            const auto& event = events[i];
+            CHECK(event.payload == expected[i] && event.seq == i);
+            CHECK(event.name == direct_cfg.name && event.tid == std::this_thread::get_id());
+            CHECK(event.loc.line() == loc.line());
+            CHECK(event.ts >= start && event.ts <= finish);
+        }
+        CHECK(events[8].lvl == chlog::level::warn);
+        CHECK(direct.stats().errors == 1 && direct.stats().dropped == 0);
+        CHECK(direct.stats().enqueued == expected.size() && direct.stats().dequeued == expected.size());
+    }
 }
 
 void parallel_tests() {
@@ -1017,6 +1121,20 @@ void fastformat_tests() {
     compare("a{}b{}c{}d", 1, 2, 3);
     compare("  {}  {}  ", 'x', true);
     compare("[{}|{}]", std::string_view("s"), std::string("t"));
+    compare(std::string_view("a\0{}b\0", 6), 7);
+    // Exhaust short brace layouts against the backend. The specialized
+    // one-field planner must decline without touching output on every mismatch.
+    for (std::size_t length = 0; length <= 6; ++length) {
+        const auto combinations = std::size_t{1} << (2 * length);
+        for (std::size_t bits = 0; bits < combinations; ++bits) {
+            std::string text(length, 'a');
+            for (std::size_t i = 0; i < length; ++i) text[i] = "ab{}"[(bits >> (2 * i)) & 3];
+            std::string fast = "prefix";
+            if (chlog::detail::format_bare_fields(fast, text, 42))
+                CHECK(fast == "prefix" + reference_format_value(text, 42));
+            else CHECK(fast == "prefix");
+        }
+    }
 
     // Integers across the full range, both signs.
     for (auto v : {0, 1, 9, 10, 42, 99, 100, 999, 1000, 12345, 2147483647, -1, -9, -100, -2147483647})
@@ -1333,6 +1451,135 @@ void reuse_tests() {
     }
 }
 
+void hotpath_tests() {
+    // More live IDs than the bounded cache holds: verify hits, eviction, the
+    // default ID, and independent caches on several rendering threads.
+    std::array<std::thread::id, 40> ids;
+    std::binary_semaphore release{0};
+    std::vector<std::thread> owners;
+    for (std::size_t i = 0; i < ids.size(); ++i) owners.emplace_back([&] {
+        release.acquire();
+        release.release();
+    });
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = owners[i].get_id();
+    std::atomic<bool> valid{true};
+    auto verify_ids = [&] {
+        for (int pass = 0; pass < 3; ++pass) for (auto id : ids) {
+            const auto expected = chlog::thread_id_string(id);
+            for (int repeat = 0; repeat < 2; ++repeat)
+                if (chlog::cached_thread_id(id) != expected) valid = false;
+            if (chlog::cached_thread_id({}) != chlog::thread_id_string({})) valid = false;
+        }
+    };
+    std::thread reader1(verify_ids), reader2(verify_ids);
+    verify_ids();
+    reader1.join(); reader2.join();
+    release.release();
+    for (auto& owner : owners) owner.join();
+    CHECK(valid);
+
+    {
+        struct verifying_sink : chlog::view_sink {
+            std::size_t count = 0, mismatches = 0;
+            void consume(const chlog::log_event_view& event) override {
+                chlog::detail::text_buffer line;
+                render_to(event, line);
+                const auto expected = std::string(event.payload) + '|' + std::string(event.payload);
+                if (line.view() != expected) ++mismatches;
+                ++count;
+            }
+        };
+        auto settings = config();
+        settings.pattern = "{tid}|{msg}";
+        settings.async.enabled = true;
+        settings.async.drop_when_full = false;
+        chlog::logger async(settings);
+        auto rendered = std::make_shared<verifying_sink>();
+        async.add_sink(rendered);
+        std::vector<std::thread> producers;
+        for (int t = 0; t < 8; ++t) producers.emplace_back([&] {
+            const auto id = chlog::thread_id_string(std::this_thread::get_id());
+            for (int i = 0; i < 200; ++i) async.log_raw(chlog::level::info, id);
+        });
+        for (auto& producer : producers) producer.join();
+        async.shutdown();
+        CHECK(rendered->count == 1600 && rendered->mismatches == 0);
+    }
+
+    // Format specifications, custom formatters and errors must behave exactly
+    // like the selected backend. Cross both the inline and retention limits.
+    auto cfg = config();
+    chlog::logger logger(cfg);
+    auto output = std::make_shared<recording_view_sink>();
+    logger.add_sink(output);
+    for (auto size : {0u, 24u, 249u, 250u, 511u, 512u, 1024u, 8000u, 9000u, 32u}) {
+        std::string text(size, 'x');
+        if (size) text[size / 2] = '\0';
+        const auto expected = chlog::detail::format_payload("[{:>40}] {:08x} {:.3f} {}", text, 123, 1.25, custom_value{7});
+        logger.info("[{:>40}] {:08x} {:.3f} {}", text, 123, 1.25, custom_value{7});
+        CHECK(output->events.back().payload == expected);
+        logger.info(std::string_view("[{:>40}] {:08x} {:.3f} {}"), text, 123, 1.25, custom_value{7});
+        CHECK(output->events.back().payload == expected);
+    }
+    const std::string_view broken = "{:>2048} {missing}";
+    logger.info(broken, "partial");
+    CHECK(output->events.back().payload == broken);
+    logger.info("{:>30}", "clean");
+    CHECK(output->events.back().payload == std::string(25, ' ') + "clean");
+    CHECK(logger.stats().errors == 1);
+
+    chlog::logger inner(cfg);
+    auto nested_output = std::make_shared<recording_view_sink>();
+    inner.add_sink(nested_output);
+    const std::string long_text(2200, 'o');
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        logger.info("outer [{:>2400}] suffix", nested_value{&inner, long_text});
+        CHECK(output->events.back().payload == "outer [" + std::string(200, ' ') + long_text + "] suffix");
+        CHECK(nested_output->events.back().payload == "inner [" + std::string(100, ' ') + std::string(3000, 'i') + "]");
+    }
+    CHECK(nested_output->events.size() == 3); // A custom formatter runs once.
+
+    // The borrowed format buffer must remain usable during late TLS teardown.
+    struct late_format {
+        chlog::logger* target;
+        ~late_format() { target->info("late [{:>2048}]", "goodbye"); }
+    };
+    std::thread late([&] {
+        static thread_local late_format final_message{&logger};
+        (void)final_message;
+        logger.info("warm [{:>2048}]", "warmup");
+    });
+    late.join();
+    CHECK(output->events.back().payload == "late [" + std::string(2041, ' ') + "goodbye]");
+    logger.shutdown();
+    inner.shutdown();
+
+    // The daily fast path writes exact bytes and still switches to compiled
+    // patterns and other dates, including empty records and embedded NULs.
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("chlog-hotpath-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct cleanup { std::filesystem::path dir; ~cleanup() { std::error_code ec; std::filesystem::remove_all(dir, ec); } } clean{dir};
+    for (bool thread_safe : {false, true}) {
+        const auto path = dir / (thread_safe ? "mt" : "st");
+        chlog::daily_file_sink daily(path);
+        daily.set_thread_safe(thread_safe);
+        chlog::log_event event;
+        event.ts = std::chrono::system_clock::now();
+        std::string expected;
+        for (auto pattern : {"{msg}", "[{msg}]", "{msg}"}) {
+            daily.set_pattern(pattern);
+            for (auto size : {0u, 1u, 511u, 512u, 4095u, 4096u, 4097u, 16384u}) {
+                event.payload.assign(size, 'd');
+                if (size) event.payload[size / 2] = '\0';
+                daily.log(event);
+                expected += std::string_view(pattern) == "{msg}" ? event.payload + '\n' : '[' + event.payload + "]\n";
+            }
+        }
+        daily.flush();
+        CHECK(read_file(path / (chlog::date_string(event.ts) + ".log")) == expected);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     try {
@@ -1347,6 +1594,7 @@ int main(int argc, char** argv) {
         else if (suite == "configuration") configuration_tests();
         else if (suite == "registration") registration_tests();
         else if (suite == "reuse") reuse_tests();
+        else if (suite == "hotpaths") hotpath_tests();
         else return 2;
         std::cout << "PASS " << suite << '\n';
     } catch (const std::exception& e) {

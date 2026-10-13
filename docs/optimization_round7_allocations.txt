@@ -1,0 +1,43 @@
+C++ operator new diagnostics; direct malloc is excluded.
+Baseline fmt 12.1.0 uses malloc for its default buffer: its zero counts do NOT mean zero allocations.
+
+before std
+FORMAT payload=64 iterations=2000 allocations=2000 allocated_bytes=160000 bytes=158000
+FORMAT payload=1024 iterations=2000 allocations=6000 allocated_bytes=3696000 bytes=2078000
+FORMAT payload=16384 iterations=2000 allocations=14000 allocated_bytes=67056000 bytes=32798000
+MEMORY queue_capacity=65536 allocated_bytes=4736064 allocations=10
+ASYNC_NAME iterations=2000 allocated_bytes=0 allocations=0 processed=2001
+REGISTRATION sinks=16 allocated_bytes=2656 allocations=47
+REGISTRATION sinks=256 allocated_bytes=42976 allocations=767
+REGISTRATION sinks=1024 allocated_bytes=172000 allocations=3071
+
+after std
+FORMAT payload=64 iterations=2000 allocations=2000 allocated_bytes=160000 bytes=158000
+FORMAT payload=1024 iterations=2000 allocations=4000 allocated_bytes=4644000 bytes=2078000
+FORMAT payload=16384 iterations=2000 allocations=4000 allocated_bytes=66084000 bytes=32798000
+MEMORY queue_capacity=65536 allocated_bytes=4736064 allocations=10
+ASYNC_NAME iterations=2000 allocated_bytes=0 allocations=0 processed=2001
+REGISTRATION sinks=16 allocated_bytes=2656 allocations=47
+REGISTRATION sinks=256 allocated_bytes=42976 allocations=767
+REGISTRATION sinks=1024 allocated_bytes=172000 allocations=3071
+
+before fmt
+FORMAT payload=64 iterations=2000 allocations=0 allocated_bytes=0 bytes=158000
+FORMAT payload=1024 iterations=2000 allocations=0 allocated_bytes=0 bytes=2078000
+FORMAT payload=16384 iterations=2000 allocations=0 allocated_bytes=0 bytes=32798000
+MEMORY queue_capacity=65536 allocated_bytes=4736064 allocations=10
+ASYNC_NAME iterations=2000 allocated_bytes=0 allocations=0 processed=2001
+REGISTRATION sinks=16 allocated_bytes=2656 allocations=47
+REGISTRATION sinks=256 allocated_bytes=42976 allocations=767
+REGISTRATION sinks=1024 allocated_bytes=172000 allocations=3071
+
+after fmt
+FORMAT payload=64 iterations=2000 allocations=0 allocated_bytes=0 bytes=158000
+FORMAT payload=1024 iterations=2000 allocations=0 allocated_bytes=0 bytes=2078000
+FORMAT payload=16384 iterations=2000 allocations=4000 allocated_bytes=81944000 bytes=32798000
+MEMORY queue_capacity=65536 allocated_bytes=4736064 allocations=10
+ASYNC_NAME iterations=2000 allocated_bytes=0 allocations=0 processed=2001
+REGISTRATION sinks=16 allocated_bytes=2656 allocations=47
+REGISTRATION sinks=256 allocated_bytes=42976 allocations=767
+REGISTRATION sinks=1024 allocated_bytes=172000 allocations=3071
+
